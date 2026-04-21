@@ -81,6 +81,28 @@ curl ... -d '{"includeThinkingInOutput":true}'
 # Toggle auto search
 curl ... -d '{"autoSearch":false}'
 ```
+---
+
+## Threading Mode
+
+Threading controls whether the proxy maintains conversation history via Qwen's `parent_id` mechanism.
+
+### Enable/Disable Threading
+
+```bash
+# Enable threading (maintains conversation context across messages)
+curl -X POST http://localhost:3456/features \
+  -H "Authorization: Bearer Waguri" \
+  -H "Content-Type: application/json" \
+  -d '{"threadingEnabled": true}'
+  ```
+```bash
+# Disable threading (each message starts fresh conversation)
+curl -X POST http://localhost:3456/features \
+  -H "Authorization: Bearer Waguri" \
+  -H "Content-Type: application/json" \
+  -d '{"threadingEnabled": false}'
+  ```
 
 ## Available chatType values
 
