@@ -22,7 +22,6 @@ const session = {
     autoSearch: true,
     thinkingMode: "Thinking",    // "Thinking" | "Fast"
     researchMode: "advance",      // "normal" | "advance"
-    chatType: "t2t",             // "t2t" | "artifacts" | "web_dev" | "slides" | "deep_research" | "search" | "learn" | "travel"
     persistHistory: false,
     threadingEnabled: false, // false=always null; true=auto-thread
     includeThinkingInOutput: false, // stream thinking_summary content as <thinking> blocks
@@ -102,10 +101,6 @@ function estimateTokens(text) {
 }
 
 function qwenHeaders(extraHeaders = {}) {
-  // Minimal headers — Qwen's /chat/completions rejects requests with stale
-  // bx-v / bx-ua / bx-umidtoken bot-guard tokens (returns HTTP 200 with
-  // {"success":false,"code":"Bad_Request"}). The working browser fetch
-  // sends only content-type; the auth cookie is what actually matters.
   return {
     "Content-Type": "application/json",
     "Accept": "*/*",
@@ -223,7 +218,6 @@ function messagesToText(messages) {
 // Qwen expects: role, content (string), plus our extra metadata fields
 function buildQwenMessages(messages, system, model, opts = {}) {
   const {
-    chatType = session.features.chatType,
     thinking = session.features.thinking,
     thinkingMode = session.features.thinkingMode,
     autoSearch = session.features.autoSearch,
@@ -232,18 +226,6 @@ function buildQwenMessages(messages, system, model, opts = {}) {
 
   const qwenMsgs = [];
   const qwenModel = model || config.qwen.defaultModel;
-
-  // Prepend system as a user message if present (Qwen has no system role)
-  if (system) {
-    const sysText = typeof system === "string"
-      ? system
-      : Array.isArray(system)
-        ? system.map(b => b.text || "").join("\n")
-        : String(system);
-    if (sysText.trim()) {
-      // We'll inject system into the first user message instead (see below)
-    }
-  }
 
   // Extract system text
   const systemText = system
@@ -302,7 +284,7 @@ function buildQwenMessages(messages, system, model, opts = {}) {
     }
 
     const fid = generateId();
-    const subChatType = chatType === "deep_research" ? "deep_thinking" : chatType;
+    const subChatType = "t2t";
 
     qwenMsgs.push({
       fid: null,
@@ -314,7 +296,7 @@ function buildQwenMessages(messages, system, model, opts = {}) {
       files: [],
       timestamp: Math.floor(Date.now() / 1000),
       models: [qwenModel],
-      chat_type: chatType,
+      chat_type: "t2t",
       feature_config: featureConfig,
       extra: { meta: { subChatType } },
       sub_chat_type: subChatType,
@@ -402,10 +384,6 @@ async function* sendToQwen(qwenMessages, opts = {}) {
     throw new Error(`Qwen error ${res.status}: ${errText}`);
   }
 
-  // Qwen returns HTTP 200 with a JSON error body when the request is rejected
-  // (bot-guard mismatch, stale token, etc.). A real streaming response comes
-  // back as text/event-stream. If we see application/json here, read it and
-  // surface the actual error instead of trying to parse it as SSE.
   const ct = res.headers.get("content-type") || "";
   if (ct.includes("application/json")) {
     const errBody = await res.text().catch(() => "");
@@ -425,7 +403,6 @@ async function* sendToQwen(qwenMessages, opts = {}) {
   let responseId = null;
   let inThinkingBlock = false;
 
-  // Use getReader() — more reliable than for-await on fetch body for SSE
   const reader = res.body.getReader();
 
   try {
@@ -440,7 +417,6 @@ async function* sendToQwen(qwenMessages, opts = {}) {
       for (const line of lines) {
         const trimmed = line.trim();
 
-        // Raw line debug — set LOG_LEVEL=debug to see every SSE line from Qwen
         if (config.logging.level === "debug") {
           console.log("[RAW SSE]", JSON.stringify(trimmed));
         }
@@ -452,17 +428,15 @@ async function* sendToQwen(qwenMessages, opts = {}) {
         try {
           const json = JSON.parse(dataStr);
 
-          // response.created event — capture responseId for parent threading
           if (json["response.created"]) {
             responseId = json["response.created"].response_id;
             if (reqSession && json["response.created"].parent_id) {
-              reqSession.parentId = json["response.created"].response_id; // correct: thread via response_id
+              reqSession.parentId = json["response.created"].response_id;
             }
             console.log(`[Qwen] response.created — chatId=${json["response.created"].chat_id?.substring(0,8)} responseId=${responseId?.substring(0,8)}`);
             continue;
           }
 
-        // Regular delta
         const choice = json.choices?.[0];
         if (!choice) continue;
 
@@ -471,11 +445,9 @@ async function* sendToQwen(qwenMessages, opts = {}) {
         const status = delta?.status;
         const content = delta?.content;
 
-        // Handle thinking_summary phase
         if (phase === "thinking_summary") {
           if (includeThinking) {
             if (status === "typing") {
-              // Extract thinking text from extra.summary_thought.content array
               const thoughtLines = delta?.extra?.summary_thought?.content;
               if (Array.isArray(thoughtLines) && thoughtLines.length > 0) {
                 if (!inThinkingBlock) {
@@ -489,17 +461,14 @@ async function* sendToQwen(qwenMessages, opts = {}) {
               inThinkingBlock = false;
             }
           }
-          // If not includeThinking, silently skip thinking blocks
           continue;
         }
 
-        // Close any open thinking block if we switched phase
         if (inThinkingBlock && phase !== "thinking_summary") {
           if (includeThinking) yield "\n</thinking>\n\n";
           inThinkingBlock = false;
         }
 
-        // Yield actual content — coerce to string, skip empty
         if (content !== undefined && content !== null && content !== "") {
           yield String(content);
         }
@@ -509,13 +478,12 @@ async function* sendToQwen(qwenMessages, opts = {}) {
           console.warn("[SSE parse error]", parseErr.message);
         }
       }
-    } // end for lines
-    } // end while(true)
+    }
+    }
   } finally {
     reader.releaseLock();
   }
 
-  // Flush any remaining buffered SSE line
   if (buffer.trim().startsWith("data: ")) {
     const dataStr = buffer.trim().slice(6);
     if (dataStr !== "[DONE]") {
@@ -527,11 +495,10 @@ async function* sendToQwen(qwenMessages, opts = {}) {
     }
   }
 
-  // Close hanging thinking block
   if (inThinkingBlock && opts.includeThinking) yield "\n</thinking>\n\n";
 }
 
-// ============== FORMAT HELPERS (same pattern as z.ai bridge) ==============
+// ============== FORMAT HELPERS ==============
 
 function generateShortId() {
   return shortId().substring(0, 24);
@@ -541,12 +508,10 @@ function estimateTokensFromContent(content) {
   return estimateTokens(typeof content === "string" ? content : JSON.stringify(content));
 }
 
-// Tool call parsing (reused from z.ai bridge pattern)
 function parseToolCalls(content) {
   const toolCalls = [];
   if (!config.parseTool || !content) return toolCalls;
 
-  // JSON in markdown code block
   const mdJsonPattern = /```(?:json)?\s*\n?\s*(\{[\s\S]*?\})\s*\n?```/gi;
   let match;
   while ((match = mdJsonPattern.exec(content)) !== null) {
@@ -586,8 +551,6 @@ function removeToolCallsFromContent(content) {
   c = c.replace(/```(?:json)?\s*\n?\s*\{[\s\S]*?"(?:name|tool_calls)"[\s\S]*?\}\s*\n?```/gi, "");
   return c.replace(/\n{3,}/g, "\n\n").trim();
 }
-
-// ── Anthropic format helpers ──
 
 function toolCallsToAnthropicBlocks(toolCalls) {
   return toolCalls.map(tc => ({
@@ -633,8 +596,6 @@ function sseEvent(event, data) {
   return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
 }
 
-// ── OpenAI format helpers ──
-
 function formatOpenAIResponse(rawContent, model, requestId, stream = false, fullContent = null) {
   const timestamp = Math.floor(Date.now() / 1000);
 
@@ -648,7 +609,6 @@ function formatOpenAIResponse(rawContent, model, requestId, stream = false, full
         choices: [{ index: 0, delta: { content: rawContent }, finish_reason: null }],
       };
     }
-    // Final chunk
     const toolCalls = parseToolCalls(fullContent);
     if (toolCalls.length > 0) {
       return {
@@ -677,7 +637,6 @@ function formatOpenAIResponse(rawContent, model, requestId, stream = false, full
     };
   }
 
-  // Non-streaming
   const toolCalls = parseToolCalls(rawContent);
   const cleanContent = toolCalls.length > 0 ? removeToolCallsFromContent(rawContent) : rawContent;
   return {
@@ -797,7 +756,7 @@ function getDashboardHTML(host) {
           <div class="stat"><div class="label">Token</div><div class="value" id="tokenStatus">...</div></div>
           <div class="stat"><div class="label">User ID</div><div class="value" id="userId" style="font-size:0.8rem">...</div></div>
           <div class="stat"><div class="label">Sessions</div><div class="value" id="sessions">0</div></div>
-          <div class="stat"><div class="label">Chat Type</div><div class="value" id="chatType">t2t</div></div>
+          <div class="stat"><div class="label">Chat Type</div><div class="value">t2t</div></div>
         </div>
       </div>
 
@@ -833,7 +792,7 @@ function getDashboardHTML(host) {
         <div class="section-label">Management</div>
         <div class="endpoint">
           <span class="method post">POST</span><span class="path">/features</span>
-          <div class="desc">Toggle: thinking, autoSearch, thinkingMode, researchMode, chatType, persistHistory, includeThinkingInOutput</div>
+          <div class="desc">Toggle: thinking, autoSearch, thinkingMode, researchMode, persistHistory, includeThinkingInOutput</div>
         </div>
         <div class="endpoint">
           <span class="method post">POST</span><span class="path">/admin/session/clear</span>
@@ -857,21 +816,6 @@ claude
     "ANTHROPIC_API_KEY": ""
   }
 }</code></div>
-
-        <h2 style="margin-top:20px">Chat Type Switching (via /features)</h2>
-        <div class="code-block"><code># Switch to artifacts mode
-curl -X POST http://${host}/features -H "Content-Type: application/json" \\
-  -H "Authorization: Bearer ${config.auth.token}" \\
-  -d '{"chatType":"artifacts"}'
-
-# Switch to deep research + advance mode
-curl -X POST http://${host}/features \\
-  -H "Content-Type: application/json" \\
-  -H "Authorization: Bearer ${config.auth.token}" \\
-  -d '{"chatType":"deep_research","researchMode":"advance"}'
-
-# Available chatType values:
-# t2t | artifacts | web_dev | slides | deep_research | search | learn | travel</code></div>
       </div>
     </div>
   </div>
@@ -884,7 +828,6 @@ curl -X POST http://${host}/features \\
         document.getElementById('tokenStatus').textContent = d.tokenValid ? '✓ Valid' : '✗ Invalid';
         document.getElementById('userId').textContent = d.userId || '-';
         document.getElementById('sessions').textContent = d.activeSessions;
-        document.getElementById('chatType').textContent = d.features?.chatType || '-';
         document.getElementById('featThinking').textContent = d.features?.thinking ? 'ON' : 'OFF';
         document.getElementById('featSearch').textContent = d.features?.autoSearch ? 'ON' : 'OFF';
         document.getElementById('featThinkMode').textContent = d.features?.thinkingMode || '-';
@@ -996,7 +939,6 @@ app.post("/v1/messages", authMiddleware, async (req, res) => {
         }));
       }
 
-      // Emit tool_use blocks if any
       const toolCalls = parseToolCalls(fullContent);
       let blockIdx = textBlockIndex + 1;
       for (const tc of toolCallsToAnthropicBlocks(toolCalls)) {
@@ -1071,7 +1013,6 @@ app.post("/v1/chat/completions", authMiddleware, async (req, res) => {
     stream = false,
     thinking,
     search,
-    chatType,
   } = req.body;
 
   if (!messages || !Array.isArray(messages)) {
@@ -1082,13 +1023,11 @@ app.post("/v1/chat/completions", authMiddleware, async (req, res) => {
   const reqSession = getOrCreateSession(req);
   const requestId = shortId();
 
-  // Extract system if present in OpenAI format
   const systemMsg = messages.find(m => m.role === "system");
   const systemText = systemMsg?.content || null;
   const userMessages = messages.filter(m => m.role !== "system");
 
   const overrideOpts = {
-    chatType: chatType || session.features.chatType,
     thinking: thinking !== undefined ? thinking : session.features.thinking,
     autoSearch: search !== undefined ? search : session.features.autoSearch,
     thinkingMode: session.features.thinkingMode,
@@ -1233,12 +1172,10 @@ app.post("/features", authMiddleware, (req, res) => {
     autoSearch,
     thinkingMode,
     researchMode,
-    chatType,
     persistHistory,
     includeThinkingInOutput,
   } = req.body;
 
-  const validChatTypes = ["t2t", "artifacts", "web_dev", "slides", "deep_research", "search", "learn", "travel"];
   const validThinkingModes = ["Thinking", "Fast"];
   const validResearchModes = ["normal", "advance"];
 
@@ -1260,16 +1197,6 @@ app.post("/features", authMiddleware, (req, res) => {
       return res.status(400).json({ error: `researchMode must be one of: ${validResearchModes.join(", ")}` });
     }
     session.features.researchMode = researchMode;
-  }
-
-  if (chatType !== undefined) {
-    if (!validChatTypes.includes(chatType)) {
-      return res.status(400).json({ error: `chatType must be one of: ${validChatTypes.join(", ")}` });
-    }
-    session.features.chatType = chatType;
-    // When switching chatType, clear existing sessions so new chats are created
-    sessions.clear();
-    console.log(`[Features] chatType → ${chatType} (sessions cleared)`);
   }
 
   console.log("[Features] Updated:", session.features);
