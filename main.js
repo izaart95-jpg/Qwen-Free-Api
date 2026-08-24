@@ -63,7 +63,7 @@ setInterval(() => {
 app.use((req, res, next) => {
   res.header("Access-Control-Allow-Origin", "*");
   res.header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
-  res.header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Api-Key, X-Session-Id, X-Fresh-Session, anthropic-version, anthropic-beta");
+  res.header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Api-Key, X-Session-Id, X-Fresh-Session");
   if (req.method === "OPTIONS") return res.sendStatus(200);
   next();
 });
@@ -332,7 +332,7 @@ async function initializeSession() {
 
 // ============== MESSAGE CONVERSION ==============
 
-// Convert Anthropic/OpenAI messages to flat text for logging (not sent to Qwen)
+// Convert OpenAI messages to flat text for logging (not sent to Qwen)
 function messagesToText(messages) {
   if (!Array.isArray(messages)) return String(messages || "");
   return messages.map(m => {
@@ -355,7 +355,7 @@ function messagesToText(messages) {
   }).join("\n\n");
 }
 
-// Convert Anthropic messages + system → Qwen messages array
+// Convert OpenAI messages + system → Qwen messages array
 // Qwen expects: role, content (string), plus our extra metadata fields
 function buildQwenMessages(messages, system, model, opts = {}) {
   const {
@@ -730,50 +730,6 @@ function removeToolCallsFromContent(content) {
   return c.replace(/\n{3,}/g, "\n\n").trim();
 }
 
-function toolCallsToAnthropicBlocks(toolCalls) {
-  return toolCalls.map(tc => ({
-    type: "tool_use",
-    id: tc.id || `toolu_${generateShortId()}`,
-    name: tc.function.name,
-    input: (() => {
-      try { return JSON.parse(tc.function.arguments); }
-      catch (_) { return { raw: tc.function.arguments }; }
-    })(),
-  }));
-}
-
-function formatAnthropicResponse(fullContent, model, requestId) {
-  const toolCalls = parseToolCalls(fullContent);
-  const cleanText = toolCalls.length > 0 ? removeToolCallsFromContent(fullContent) : fullContent;
-  const contentBlocks = [];
-
-  if (cleanText && cleanText.trim()) contentBlocks.push({ type: "text", text: cleanText });
-  if (toolCalls.length > 0) contentBlocks.push(...toolCallsToAnthropicBlocks(toolCalls));
-  if (contentBlocks.length === 0) contentBlocks.push({ type: "text", text: "" });
-
-  return {
-    id: `msg_${requestId}`,
-    type: "message",
-    role: "assistant",
-    model: model || config.qwen.defaultModel,
-    content: contentBlocks,
-    stop_reason: toolCalls.length > 0 ? "tool_use" : "end_turn",
-    stop_sequence: null,
-    usage: {
-      input_tokens: estimateTokens(fullContent),
-      output_tokens: estimateTokens(fullContent),
-    },
-  };
-}
-
-function formatAnthropicError(message, type = "api_error") {
-  return { type: "error", error: { type, message } };
-}
-
-function sseEvent(event, data) {
-  return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
-}
-
 function formatOpenAIResponse(rawContent, model, requestId, stream = false, fullContent = null) {
   const timestamp = Math.floor(Date.now() / 1000);
 
@@ -849,8 +805,8 @@ function mapToQwenModel(modelName) {
   const m = (modelName || "").toLowerCase();
   // Live Qwen models (verified via /api/v2/models): qwen3.7-plus, qwen3.8-max,
   // qwen3.7-max, qwen3.6-plus, qwen3.5-plus, qwen3.5-omni-plus
-  if (m.includes("opus") || m.includes("max")) return "qwen3.8-max";
-  if (m.includes("haiku") || m.includes("flash")) return "qwen3.5-plus";
+  if (m.includes("max")) return "qwen3.8-max";
+  if (m.includes("flash")) return "qwen3.5-plus";
   if (m.includes("coder") || m.includes("code")) return "qwen3-coder-plus";
   if (m.includes("qwen")) return modelName; // pass qwen models through directly
   return config.qwen.defaultModel; // default: qwen3.6-plus
@@ -889,7 +845,6 @@ function getDashboardHTML(host) {
     .badge { display: inline-block; padding: 4px 12px; border-radius: 12px; font-size: 0.8rem; font-weight: 700; }
     .badge-green { background: #22c55e; color: #000; }
     .badge-blue  { background: #2f80ed; color: #fff; }
-    .badge-purple{ background: #a855f7; color: #fff; }
     .badge-orange{ background: #f59e0b; color: #000; }
     .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 20px; }
     .card {
@@ -920,11 +875,10 @@ function getDashboardHTML(host) {
   <div class="container">
     <div class="header">
       <h1>Qwen Bridge</h1>
-      <p>Proxy for chat.qwen.ai — OpenAI & Anthropic compatible</p>
+      <p>Proxy for chat.qwen.ai — OpenAI compatible</p>
       <div class="badges">
         <span class="badge badge-green">⚡ Direct Mode</span>
         <span class="badge badge-blue">OpenAI Compatible</span>
-        <span class="badge badge-purple">Anthropic Compatible</span>
         <span class="badge badge-orange">Qwen Native</span>
       </div>
     </div>
@@ -953,20 +907,16 @@ function getDashboardHTML(host) {
       <div class="card" style="grid-column: span 2;">
         <h2>API Endpoints</h2>
 
-        <div class="section-label">Anthropic-Compatible (Claude Code)</div>
-        <div class="endpoint">
-          <span class="method post">POST</span><span class="path">/v1/messages</span>
-          <div class="desc">Anthropic Messages API — streaming SSE + tool_use. Set ANTHROPIC_BASE_URL=http://${host}</div>
-        </div>
-        <div class="endpoint">
-          <span class="method get">GET</span><span class="path">/v1/models</span>
-          <div class="desc">Lists Qwen models (fetched live from chat.qwen.ai) + Anthropic aliases</div>
-        </div>
-
         <div class="section-label">OpenAI-Compatible</div>
         <div class="endpoint">
           <span class="method post">POST</span><span class="path">/v1/chat/completions</span>
           <div class="desc">OpenAI chat endpoint. Supports streaming.</div>
+        </div>
+
+        <div class="section-label">Models</div>
+        <div class="endpoint">
+          <span class="method get">GET</span><span class="path">/v1/models</span>
+          <div class="desc">Lists Qwen models (fetched live from chat.qwen.ai)</div>
         </div>
 
         <div class="section-label">Management</div>
@@ -978,24 +928,6 @@ function getDashboardHTML(host) {
           <span class="method post">POST</span><span class="path">/admin/session/clear</span>
           <div class="desc">Clear all session histories and chat IDs</div>
         </div>
-      </div>
-
-      <div class="card" style="grid-column: span 2;">
-        <h2>Claude Code Setup</h2>
-        <div class="code-block"><code># PowerShell / CMD
-set ANTHROPIC_BASE_URL=http://localhost:${config.server.port}
-set ANTHROPIC_AUTH_TOKEN=${config.auth.token}
-set ANTHROPIC_API_KEY=
-claude
-
-# ~/.claude/settings.json
-{
-  "env": {
-    "ANTHROPIC_BASE_URL": "http://localhost:${config.server.port}",
-    "ANTHROPIC_AUTH_TOKEN": "${config.auth.token}",
-    "ANTHROPIC_API_KEY": ""
-  }
-}</code></div>
       </div>
     </div>
   </div>
@@ -1036,150 +968,6 @@ app.get("/status", (req, res) => {
     features: session.features,
     parseTool: config.parseTool,
   });
-});
-
-// ============================================================
-// ── ANTHROPIC-COMPATIBLE /v1/messages ───────────────────────
-// ============================================================
-
-app.post("/v1/messages", authMiddleware, async (req, res) => {
-  const {
-    model: reqModel = config.qwen.defaultModel,
-    messages,
-    system,
-    stream = false,
-  } = req.body;
-
-  if (!messages || !Array.isArray(messages)) {
-    return res.status(400).json(formatAnthropicError("messages is required and must be an array", "invalid_request_error"));
-  }
-
-  const qwenModel = mapToQwenModel(reqModel);
-  const reqSession = getOrCreateSession(req);
-  const requestId = shortId();
-
-  const qwenMsgs = buildQwenMessages(messages, system, qwenModel);
-
-  const opts = {
-    model: qwenModel,
-    reqSession,
-    includeThinking: session.features.includeThinkingInOutput,
-  };
-
-  // ── STREAMING ──
-  if (stream) {
-    res.setHeader("Content-Type", "text/event-stream");
-    res.setHeader("Cache-Control", "no-cache");
-    res.setHeader("Connection", "keep-alive");
-    res.setHeader("X-Accel-Buffering", "no");
-    res.flushHeaders();
-
-    const msgId = `msg_${requestId}`;
-    const inputTokens = estimateTokens(messagesToText(messages));
-
-    res.write(sseEvent("message_start", {
-      type: "message_start",
-      message: {
-        id: msgId, type: "message", role: "assistant",
-        model: reqModel, content: [],
-        stop_reason: null, stop_sequence: null,
-        usage: { input_tokens: inputTokens, output_tokens: 0 },
-      },
-    }));
-
-    const keepAlive = setInterval(() => {
-      try { res.write(": ping\n\n"); } catch (_) { clearInterval(keepAlive); }
-    }, 8000);
-
-    let fullContent = "";
-    let textBlockOpen = false;
-    const textBlockIndex = 0;
-
-    try {
-      for await (const chunk of sendToQwen(qwenMsgs, opts)) {
-        fullContent += chunk;
-
-        if (!textBlockOpen) {
-          res.write(sseEvent("content_block_start", {
-            type: "content_block_start", index: textBlockIndex,
-            content_block: { type: "text", text: "" },
-          }));
-          textBlockOpen = true;
-        }
-
-        res.write(sseEvent("content_block_delta", {
-          type: "content_block_delta", index: textBlockIndex,
-          delta: { type: "text_delta", text: chunk },
-        }));
-      }
-
-      if (textBlockOpen) {
-        res.write(sseEvent("content_block_stop", {
-          type: "content_block_stop", index: textBlockIndex,
-        }));
-      }
-
-      const toolCalls = parseToolCalls(fullContent);
-      let blockIdx = textBlockIndex + 1;
-      for (const tc of toolCallsToAnthropicBlocks(toolCalls)) {
-        const inputJson = JSON.stringify(tc.input);
-        res.write(sseEvent("content_block_start", {
-          type: "content_block_start", index: blockIdx,
-          content_block: { type: "tool_use", id: tc.id, name: tc.name, input: {} },
-        }));
-        res.write(sseEvent("content_block_delta", {
-          type: "content_block_delta", index: blockIdx,
-          delta: { type: "input_json_delta", partial_json: inputJson },
-        }));
-        res.write(sseEvent("content_block_stop", { type: "content_block_stop", index: blockIdx }));
-        blockIdx++;
-      }
-
-      const outputTokens = estimateTokens(fullContent);
-      const stopReason = toolCalls.length > 0 ? "tool_use" : "end_turn";
-
-      res.write(sseEvent("message_delta", {
-        type: "message_delta",
-        delta: { stop_reason: stopReason, stop_sequence: null },
-        usage: { output_tokens: outputTokens },
-      }));
-      res.write(sseEvent("message_stop", { type: "message_stop" }));
-      res.write(`data: [DONE]\n\n`);
-
-      if (session.features.persistHistory) {
-        reqSession.messages.push({ role: "user", content: messagesToText(messages) });
-        if (fullContent) reqSession.messages.push({ role: "assistant", content: fullContent });
-      }
-
-    } catch (e) {
-      console.error("[Anthropic Stream] Error:", e.message);
-      res.write(sseEvent("error", { type: "error", error: { type: "api_error", message: e.message } }));
-      res.write(`data: [DONE]\n\n`);
-    } finally {
-      clearInterval(keepAlive);
-      res.end();
-    }
-
-  // ── NON-STREAMING ──
-  } else {
-    try {
-      let fullContent = "";
-      for await (const chunk of sendToQwen(qwenMsgs, opts)) {
-        fullContent += chunk;
-      }
-
-      if (session.features.persistHistory) {
-        reqSession.messages.push({ role: "user", content: messagesToText(messages) });
-        if (fullContent) reqSession.messages.push({ role: "assistant", content: fullContent });
-      }
-
-      res.json(formatAnthropicResponse(fullContent, reqModel, requestId));
-    } catch (e) {
-      console.error("[Anthropic API] Error:", e.message);
-      const status = e.message.includes("401") ? 401 : 500;
-      res.status(status).json(formatAnthropicError(e.message));
-    }
-  }
 });
 
 // ============================================================
@@ -1292,14 +1080,10 @@ app.post("/v1/chat/completions", authMiddleware, async (req, res) => {
 });
 
 // ============================================================
-// ── /v1/models — fetch live from Qwen + Anthropic aliases ───
+// ── /v1/models — fetch live from Qwen ───────────────────────
 // ============================================================
 
 app.get("/v1/models", authMiddleware, async (req, res) => {
-  const anthropicAliases = [
-    "claude-sonnet-4-6", "claude-opus-4-6", "claude-haiku-4-5-20251001",
-  ];
-
   let qwenModels = [];
   try {
     const r = await fetchQwen(`${BASE_URL}/api/v2/models/`, {
@@ -1325,15 +1109,7 @@ app.get("/v1/models", authMiddleware, async (req, res) => {
     ].map(id => ({ id, object: "model", created: Math.floor(Date.now() / 1000), owned_by: "qwen" }));
   }
 
-  const aliasModels = anthropicAliases.map(id => ({
-    id,
-    object: "model",
-    created: Math.floor(Date.now() / 1000),
-    owned_by: "anthropic",
-    display_name: id,
-  }));
-
-  res.json({ object: "list", data: [...qwenModels, ...aliasModels] });
+  res.json({ object: "list", data: qwenModels });
 });
 
 app.get("/models", authMiddleware, (req, res) => {
@@ -1416,14 +1192,9 @@ server.listen(config.server.port, config.server.host, async () => {
 ║                  Qwen Bridge Server Started                  ║
 ╠══════════════════════════════════════════════════════════════╣
 ║  Dashboard:       http://localhost:${String(port).padEnd(26)}║
-║  Anthropic API:   http://localhost:${port}/v1/messages         ║
 ║  OpenAI API:      http://localhost:${port}/v1/chat/completions ║
 ╠══════════════════════════════════════════════════════════════╣
 ║  Auth Token:      ${config.auth.token.padEnd(43)}║
-╠══════════════════════════════════════════════════════════════╣
-║  Claude Code:                                                ║
-║  set ANTHROPIC_BASE_URL=http://localhost:${String(port).padEnd(19)}║
-║  set ANTHROPIC_AUTH_TOKEN=${config.auth.token.padEnd(35)}║
 ╚══════════════════════════════════════════════════════════════╝
 `);
 
