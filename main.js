@@ -101,14 +101,9 @@ function estimateTokens(text) {
 }
 
 function qwenHeaders(extraHeaders = {}) {
-  // Optional extra cookies (QWEN_COOKIES env), e.g. a full browser cookie
-  // string — useful if upstream demands additional Aliyun context cookies.
-  const cookie = `token=${config.qwen.token}` +
-    (config.qwen.extraCookies ? `; ${config.qwen.extraCookies}` : "");
   return {
     "Content-Type": "application/json",
     "Accept": "*/*",
-    "Cookie": cookie,
     "Authorization": `Bearer ${config.qwen.token}`,
     // ── REQUIRED BY THE ALIYUN WAF ON chat.qwen.ai (verified empirically) ──
     // POST /api/v2/chat/completions requires ALL THREE headers below;
