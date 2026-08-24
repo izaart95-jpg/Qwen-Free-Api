@@ -12,7 +12,7 @@ An **OpenAI-compatible** API proxy for [chat.qwen.ai](https://chat.qwen.ai). Dro
 - **Frontend version self-healing** — The `Version` header required by Qwen's completions API is scraped from the site bundle, cached 30 min, refreshed in the background, and retried once with a fresh value if Qwen bumps it mid-run
 - **Streaming + non-streaming** — Full SSE support with keep-alive pings every 8 s
 - **Per-session threading** — Optional `parent_id` chaining per `X-Session-Id`, with lazy Qwen chat creation and a 30-min TTL sweeper
-- **Thinking summaries** — Qwen's `thinking_summary` phase can be streamed inline as `<thinking>` blocks
+- **Thinking summaries** — Qwen's `thinking_summary` phase can be streamed as `reasoning_content` blocks
 - **Live model list** — Models fetched from Qwen's `/api/v2/models` (falls back to a static list)
 - **Runtime feature toggles** — Flip thinking, auto-search, threading, research mode, and more via `POST /features`
 - **Built-in dashboard** — `GET /` serves a status page (token validity, sessions, feature flags)
@@ -200,8 +200,7 @@ Response:
     "thinkingMode": "Thinking",
     "researchMode": "advance",
     "persistHistory": false,
-    "threadingEnabled": false,
-    "includeThinkingInOutput": false
+    "threadingEnabled": false
   }
 }
 ```
@@ -216,7 +215,6 @@ Response:
 | `researchMode` | `"normal"` \| `"advance"` | Research depth (invalid values → `400`) |
 | `threadingEnabled` | bool | Chain requests via `parent_id`; disabling resets all stored parents |
 | `persistHistory` | bool | Keep request/response pairs for `/admin/stats` (not replayed to Qwen) |
-| `includeThinkingInOutput` | bool | Stream the `thinking_summary` phase as `<thinking>...</thinking>` blocks |
 
 ---
 
@@ -248,16 +246,10 @@ curl -N -X POST http://localhost:3456/v1/chat/completions \
   }'
 ```
 
-**Deep thinking with visible reasoning**
+**Deep thinking**
 
 ```bash
-# 1. Let thinking summaries through to the client
-curl -X POST http://localhost:3456/features \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer Waguri" \
-  -d '{"includeThinkingInOutput": true}'
-
-# 2. Request with thinking enabled
+# 1. Request with thinking enabled
 curl -N -X POST http://localhost:3456/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer Waguri" \
