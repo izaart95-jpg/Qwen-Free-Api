@@ -11,7 +11,6 @@ An **OpenAI-compatible** API proxy for [chat.qwen.ai](https://chat.qwen.ai). Dro
 - **Aliyun WAF bypass** — Auth travels as the `token` cookie with a browser User-Agent; challenge pages are detected and retried automatically with backoff
 - **Frontend version self-healing** — The `Version` header required by Qwen's completions API is scraped from the site bundle, cached 30 min, refreshed in the background, and retried once with a fresh value if Qwen bumps it mid-run
 - **Streaming + non-streaming** — Full SSE support with keep-alive pings every 8 s
-- **Tool-call parsing** — `tool_calls` JSON blocks the model emits inside markdown fences are intercepted, stripped from the content, and re-emitted as native OpenAI `tool_calls` with `finish_reason="tool_calls"`
 - **Per-session threading** — Optional `parent_id` chaining per `X-Session-Id`, with lazy Qwen chat creation and a 30-min TTL sweeper
 - **Thinking summaries** — Qwen's `thinking_summary` phase can be streamed inline as `<thinking>` blocks
 - **Live model list** — Models fetched from Qwen's `/api/v2/models` (falls back to a static list)
@@ -123,7 +122,6 @@ All configuration is environment-driven (see `config.js`). No CLI flags.
 | `QWEN_USER_AGENT` | *(Chrome UA)* | Browser User-Agent — **required** to pass the Aliyun WAF; non-browser UAs get a CAPTCHA punish page |
 | `QWEN_WAF_RETRIES` | `2` | How many times to retry when the WAF serves its challenge page anyway |
 | `QWEN_FE_VERSION` | `auto` | Pin the frontend `Version` header (e.g. `0.2.87`) to skip scraping; `auto` scrapes + self-heals |
-| `PARSE_TOOL` | `true` | Parse tool-call JSON blocks from model output into native `tool_calls` (`false` disables) |
 | `LOG_LEVEL` | `info` | Log level — `debug` dumps every Qwen request body and raw SSE line |
 
 ### `config.js` options (file-level)
@@ -172,7 +170,7 @@ System messages are folded into the first user message before being sent upstrea
 | Method | Path | Auth | Description |
 |---|---|---|---|
 | `GET`  | `/` | ❌ | HTML dashboard — token status, sessions, feature flags |
-| `GET`  | `/status` | ❌ | JSON status (`tokenValid`, `userId`, `activeSessions`, `features`, `parseTool`) |
+| `GET`  | `/status` | ❌ | JSON status (`tokenValid`, `userId`, `activeSessions`, `features`) |
 | `POST` | `/features` | ✅ | Runtime feature toggles (see below) |
 | `POST` | `/admin/session/clear` | ✅ | Clear all session histories and chat IDs |
 | `GET`  | `/admin/health` | ❌ | Health check (`200` if the token is initialised, else `503`) |
@@ -319,7 +317,6 @@ print(resp.choices[0].message.content)
 
 5. **Streaming** — Qwen's SSE is parsed (`response.created`, `phase: "thinking_summary"`, `delta.content`) and re-emitted as standard OpenAI chunks, terminated with `data: [DONE]`. Keep-alive pings are written every 8 s so idle proxies don't drop the connection.
 
-6. **Tool-call extraction** — With `PARSE_TOOL` enabled, any fenced JSON block containing `tool_calls` (or a bare `{name, arguments}` object) in the assistant output is parsed, removed from the visible content, and returned as native OpenAI `tool_calls` — streamed as a final delta with `finish_reason="tool_calls"` or embedded in the non-streaming response.
 
 ---
 
@@ -327,7 +324,7 @@ print(resp.choices[0].message.content)
 
 ```
 qwen-api/
-├── main.js          # Express server: endpoints, WAF handling, SSE bridge, tool-call parsing, dashboard
+├── main.js          # Express server: endpoints, WAF handling, SSE bridge, dashboard
 ├── config.js        # Env-driven configuration (token, auth, WAF, logging)
 ├── package.json
 └── README.md
@@ -338,7 +335,6 @@ qwen-api/
 ## Notes
 
 - **OpenAI-compatible only** — there is no Anthropic `/v1/messages` endpoint; point OpenAI-style clients at `http://localhost:<port>/v1`.
-- The `tools` request field is **not** translated into anything Qwen understands. Tool calling works by prompting the model to emit `tool_calls` JSON blocks, which the proxy then parses out (`PARSE_TOOL=true`).
 - `usage` token counts are estimates (`characters / 4`) — treat them as approximations.
 - Sessions live **in memory only**: they survive until restart or a 30-minute idle TTL (swept every 5 minutes), and `POST /admin/session/clear` wipes them immediately.
 - Text-to-text only (`chat_type: "t2t"`) — image and file uploads are not supported.
