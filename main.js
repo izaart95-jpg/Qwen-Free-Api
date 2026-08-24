@@ -128,10 +128,76 @@ function qwenHeaders(extraHeaders = {}) {
     "Cookie": qwenCookie(),
     "X-Request-Id": generateId(),
     "source": "web",
-    "Version": config.qwen.frontendVersion || "0.2.87",
+    "Version": getFeVersion(),
     "X-Accel-Buffering": "no",
     ...extraHeaders,
   };
+}
+
+// ============== FRONTEND VERSION AUTO-DETECT ==============
+// Qwen's backend requires the web app's frontend version in the `Version`
+// header on /api/v2/chat/completions. The site's homepage HTML references its
+// bundle as .../qwenweb/qwen-chat-fe/<VERSION>/js/main.js — so we scrape it,
+// cache for 30 min, refresh in background, and self-heal (retry once with a
+// fresh version) if Qwen bumps it while we're running.
+// Override: set QWEN_FE_VERSION=<version> to pin and skip scraping entirely.
+const DEFAULT_FE_VERSION = "0.2.87"; // last known good (2026-08-24)
+const FE_VERSION_TTL_MS = 30 * 60 * 1000;
+
+let feVersion = null;
+let feVersionFetchedAt = 0;
+let feVersionPromise = null;
+
+function getFeVersion() {
+  return feVersion || DEFAULT_FE_VERSION;
+}
+
+function extractFeVersion(html) {
+  const m = String(html || "").match(/\/qwen-chat-fe\/([0-9][0-9A-Za-z._-]*)\//);
+  return m ? m[1] : null;
+}
+
+async function fetchFrontendVersion() {
+  const override = String(process.env.QWEN_FE_VERSION || config.qwen.frontendVersion || "auto").trim();
+  if (override && override.toLowerCase() !== "auto") return override; // explicit pin
+  try {
+    const res = await fetch(`${BASE_URL}/`, {
+      headers: { "User-Agent": config.qwen.userAgent, "Accept": "text/html,application/xhtml+xml" },
+      signal: AbortSignal.timeout(10000),
+    });
+    if (res.ok) {
+      const v = extractFeVersion(await res.text());
+      if (v) return v;
+    }
+    console.warn(`[Version] Could not scrape frontend version from homepage (status ${res.status}) — keeping ${getFeVersion()}`);
+  } catch (e) {
+    console.warn(`[Version] Frontend version scrape failed (${e.message}) — keeping ${getFeVersion()}`);
+  }
+  return null;
+}
+
+async function resolveFeVersion({ force = false } = {}) {
+  if (!force && feVersion && Date.now() - feVersionFetchedAt < FE_VERSION_TTL_MS) return feVersion;
+  if (!feVersionPromise) {
+    feVersionPromise = (async () => {
+      const v = await fetchFrontendVersion();
+      if (v) {
+        if (!feVersion) console.log(`[Version] Resolved frontend version: ${v}`);
+        else if (feVersion !== v) console.log(`[Version] Frontend updated: ${feVersion} → ${v}`);
+        feVersion = v;
+        feVersionFetchedAt = Date.now();
+      }
+      return feVersion;
+    })().finally(() => { feVersionPromise = null; });
+  }
+  return feVersionPromise;
+}
+
+async function ensureFeVersion() {
+  if (!feVersion) { await resolveFeVersion(); return; }
+  if (Date.now() - feVersionFetchedAt >= FE_VERSION_TTL_MS) {
+    resolveFeVersion().catch(() => {}); // background refresh; keep serving cached
+  }
 }
 
 // ============== WAF CHALLENGE DETECTION & RETRY ==============
@@ -231,6 +297,9 @@ async function initializeSession() {
   console.log("[Session] Validating Qwen token...");
 
   try {
+    // Resolve the frontend `Version` header before any Qwen call
+    await resolveFeVersion().catch(() => {});
+
     // Decode userId from JWT (no network needed)
     const parts = config.qwen.token.split(".");
     if (parts.length === 3) {
@@ -390,6 +459,7 @@ async function* sendToQwen(qwenMessages, opts = {}) {
   } = opts;
 
   if (!session.initialized) await initializeSession();
+  await ensureFeVersion(); // cached after first call; background-refreshes on TTL
 
   // Get or create chatId for this session
   let chatId = providedChatId;
@@ -442,44 +512,60 @@ async function* sendToQwen(qwenMessages, opts = {}) {
   }
 
   const url = `${BASE_URL}/api/v2/chat/completions?chat_id=${chatId}`;
-  const headers = qwenHeaders({ "Referer": `${BASE_URL}/c/${chatId}` });
 
-  let res;
-  try {
-    res = await fetchQwen(url, {
-      method: "POST",
-      headers,
-      body,
-    }, { timeoutMs: 120000 });
-  } catch (e) {
-    throw new Error(`Qwen connection error: ${e.message}`);
-  }
-
-  if (res.status === 401) {
-    session.initialized = false;
-    throw new Error("Qwen token expired or invalid (401). Update QWEN_TOKEN in config.");
-  }
-
-  if (!res.ok) {
-    const errText = await res.text().catch(() => "");
-    throw new Error(`Qwen error ${res.status}: ${errText}`);
-  }
-
-  const ct = res.headers.get("content-type") || "";
-  if (ct.includes("text/html")) {
-    const errBody = await res.text().catch(() => "");
-    throw new Error(`Qwen WAF CAPTCHA challenge page returned for chat completions (${res.status}). ${errBody.slice(0, 200)}`);
-  }
-  if (ct.includes("application/json")) {
-    const errBody = await res.text().catch(() => "");
-    const wafHint = /RGV587|FAIL_SYS_USER_VALIDATE|punish|x5sec/i.test(errBody)
-      ? " — WAF/CAPTCHA challenge (RGV587)" : "";
-    let qwenCode = "";
+  // One retry reserved for the stale-`Version` signature: if Qwen bumps its
+  // frontend while we run, completions answer 200 JSON Bad_Request until we
+  // refresh the header. We force-refresh the scraped version and try once more.
+  let res = null;
+  while (true) {
+    let r;
     try {
-      const j = JSON.parse(errBody);
-      if (j?.data?.code) qwenCode = ` [${j.data.code}] ${j.data.details || ""}`;
-    } catch (_) {}
-    throw new Error(`Qwen rejected request (200 JSON)${wafHint}${qwenCode}: ${errBody.slice(0, 300)}`);
+      r = await fetchQwen(url, {
+        method: "POST",
+        headers: qwenHeaders({ "Referer": `${BASE_URL}/c/${chatId}` }),
+        body,
+      }, { timeoutMs: 120000 });
+    } catch (e) {
+      throw new Error(`Qwen connection error: ${e.message}`);
+    }
+
+    if (r.status === 401) {
+      session.initialized = false;
+      throw new Error("Qwen token expired or invalid (401). Update QWEN_TOKEN in config.");
+    }
+
+    if (!r.ok) {
+      const errText = await r.text().catch(() => "");
+      throw new Error(`Qwen error ${r.status}: ${errText}`);
+    }
+
+    const ct = r.headers.get("content-type") || "";
+    if (ct.includes("text/html")) {
+      const errBody = await r.text().catch(() => "");
+      throw new Error(`Qwen WAF CAPTCHA challenge page returned for chat completions (${r.status}). ${errBody.slice(0, 200)}`);
+    }
+    if (ct.includes("application/json")) {
+      const errBody = await r.text().catch(() => "");
+      const wafHint = /RGV587|FAIL_SYS_USER_VALIDATE|punish|x5sec/i.test(errBody)
+        ? " — WAF/CAPTCHA challenge (RGV587)" : "";
+      let code = "", details = "";
+      try {
+        const j = JSON.parse(errBody);
+        code = j?.data?.code || "";
+        details = String(j?.data?.details || "");
+      } catch (_) {}
+      if (/Bad_Request/i.test(code) && /internal error/i.test(details)) {
+        console.warn(`[Version] Completions rejected (Bad_Request) with Version=${getFeVersion()} — force-refreshing and retrying once...`);
+        const prev = getFeVersion();
+        await resolveFeVersion({ force: true });
+        if (getFeVersion() !== prev) continue; // header changed → retry with it
+        console.warn("[Version] Scrape found no newer version — failing as before.");
+      }
+      throw new Error(`Qwen rejected request (200 JSON)${wafHint}${code ? ` [${code}] ${details}` : ""}: ${errBody.slice(0, 300)}`);
+    }
+
+    res = r;
+    break;
   }
 
   if (config.logging.level === "debug") {
