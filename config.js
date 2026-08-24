@@ -22,11 +22,12 @@ module.exports = {
     extraCookies: process.env.QWEN_COOKIES || "",
     // How many times to retry when the WAF serves its challenge page anyway.
     wafRetries: parseInt(process.env.QWEN_WAF_RETRIES || "2"),
-    // Frontend version header — REQUIRED by /api/v2/chat/completions.
-    // chat.qwen.ai's own bundle sets `Version: <fe-version>` on every API call;
-    // without it the backend returns 200 JSON {"code":"Bad_Request",
-    // "details":"Internal error..."} (verified empirically 2026-08-24).
-    frontendVersion: process.env.QWEN_FE_VERSION || "0.2.87",
+    // Frontend version sent as the `Version` header — REQUIRED by
+    // /api/v2/chat/completions (missing it → 200 JSON Bad_Request "Internal error...").
+    // "auto" (default): scraped from chat.qwen.ai's homepage, cached 30 min,
+    // background-refreshed, and retried once with a fresh value if Qwen bumps it.
+    // Pin a literal version here or via QWEN_FE_VERSION=0.2.87 to skip scraping.
+    frontendVersion: process.env.QWEN_FE_VERSION || "auto",
   },
 
   // Auth for THIS proxy — clients must send this to talk to us
