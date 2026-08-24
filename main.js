@@ -119,14 +119,16 @@ function qwenHeaders(extraHeaders = {}) {
     "Accept-Language": "en-US,en;q=0.9",
     "Connection": "keep-alive",
     "User-Agent": config.qwen.userAgent,
-    // ── REQUIRED BY THE ALIYUN WAF ON chat.qwen.ai ──
-    // Auth goes via the `token` cookie above (NOT a Bearer header).
+    // ── REQUIRED BY chat.qwen.ai BACKEND ──
+    // Auth goes via the `token` cookie above (NOT a Bearer header) to pass the WAF.
+    // `Version` is REQUIRED by /api/v2/chat/completions itself: the web bundle
+    // sends its frontend version on every API call, and without that header the
+    // endpoint answers 200 JSON {"code":"Bad_Request","details":"Internal error..."}.
     // X-Request-Id + source are required by /api/v2/chats/new.
-    // Missing any of this browser-like set → HTTP 200 text/html CAPTCHA page
-    // (_____tmd_____/punish?x5secdata=...) or RGV587_ERROR instead of JSON/SSE.
     "Cookie": qwenCookie(),
     "X-Request-Id": generateId(),
     "source": "web",
+    "Version": config.qwen.frontendVersion || "0.2.87",
     "X-Accel-Buffering": "no",
     ...extraHeaders,
   };
