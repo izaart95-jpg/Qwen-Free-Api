@@ -340,13 +340,9 @@ function messagesToText(messages) {
     if (typeof content === "string") return content;
     if (Array.isArray(content)) {
       return content
-        .filter(b => b.type === "text" || b.type === "tool_result" || typeof b === "string")
+        .filter(b => b.type === "text" || typeof b === "string")
         .map(b => {
           if (typeof b === "string") return b;
-          if (b.type === "tool_result") {
-            const inner = Array.isArray(b.content) ? b.content.map(c => c.text || "").join("\n") : (b.content || "");
-            return `[Tool Result]: ${inner}`;
-          }
           return b.text || "";
         })
         .join("\n");
@@ -400,13 +396,6 @@ function buildQwenMessages(messages, system, model, opts = {}) {
       for (const block of msg.content) {
         if (block.type === "text") {
           parts.push(block.text);
-        } else if (block.type === "tool_result") {
-          const inner = Array.isArray(block.content)
-            ? block.content.map(c => c.text || "").join("\n")
-            : (block.content || "");
-          parts.push(`[Tool Result]: ${inner}`);
-        } else if (block.type === "tool_use") {
-          parts.push(`[Tool Call: ${block.name}(${JSON.stringify(block.input)})]`);
         } else if (block.text) {
           parts.push(block.text);
         }
@@ -615,48 +604,48 @@ async function* sendToQwen(qwenMessages, opts = {}) {
             continue;
           }
 
-        const choice = json.choices?.[0];
-        if (!choice) continue;
+          const choice = json.choices?.[0];
+          if (!choice) continue;
 
-        const delta = choice.delta;
-        const phase = delta?.phase;
-        const status = delta?.status;
-        const content = delta?.content;
+          const delta = choice.delta;
+          const phase = delta?.phase;
+          const status = delta?.status;
+          const content = delta?.content;
 
-        if (phase === "thinking_summary") {
-          if (includeThinking) {
-            if (status === "typing") {
-              const thoughtLines = delta?.extra?.summary_thought?.content;
-              if (Array.isArray(thoughtLines) && thoughtLines.length > 0) {
-                if (!inThinkingBlock) {
-                  yield "<thinking>\n";
-                  inThinkingBlock = true;
+          if (phase === "thinking_summary") {
+            if (includeThinking) {
+              if (status === "typing") {
+                const thoughtLines = delta?.extra?.summary_thought?.content;
+                if (Array.isArray(thoughtLines) && thoughtLines.length > 0) {
+                  if (!inThinkingBlock) {
+                    yield "<thinking>\n";
+                    inThinkingBlock = true;
+                  }
+                  yield thoughtLines.join("\n");
                 }
-                yield thoughtLines.join("\n");
+              } else if (status === "finished" && inThinkingBlock) {
+                yield "\n</thinking>\n\n";
+                inThinkingBlock = false;
               }
-            } else if (status === "finished" && inThinkingBlock) {
-              yield "\n</thinking>\n\n";
-              inThinkingBlock = false;
             }
+            continue;
           }
-          continue;
-        }
 
-        if (inThinkingBlock && phase !== "thinking_summary") {
-          if (includeThinking) yield "\n</thinking>\n\n";
-          inThinkingBlock = false;
-        }
+          if (inThinkingBlock && phase !== "thinking_summary") {
+            if (includeThinking) yield "\n</thinking>\n\n";
+            inThinkingBlock = false;
+          }
 
-        if (content !== undefined && content !== null && content !== "") {
-          yield String(content);
-        }
+          if (content !== undefined && content !== null && content !== "") {
+            yield String(content);
+          }
 
-      } catch (parseErr) {
-        if (config.logging.level === "debug") {
-          console.warn("[SSE parse error]", parseErr.message);
+        } catch (parseErr) {
+          if (config.logging.level === "debug") {
+            console.warn("[SSE parse error]", parseErr.message);
+          }
         }
       }
-    }
     }
   } finally {
     reader.releaseLock();
@@ -678,101 +667,19 @@ async function* sendToQwen(qwenMessages, opts = {}) {
 
 // ============== FORMAT HELPERS ==============
 
-function generateShortId() {
-  return shortId().substring(0, 24);
-}
-
-function estimateTokensFromContent(content) {
-  return estimateTokens(typeof content === "string" ? content : JSON.stringify(content));
-}
-
-function parseToolCalls(content) {
-  const toolCalls = [];
-  if (!config.parseTool || !content) return toolCalls;
-
-  const mdJsonPattern = /```(?:json)?\s*\n?\s*(\{[\s\S]*?\})\s*\n?```/gi;
-  let match;
-  while ((match = mdJsonPattern.exec(content)) !== null) {
-    try {
-      const j = JSON.parse(match[1]);
-      if (j.tool_calls && Array.isArray(j.tool_calls)) {
-        for (const tc of j.tool_calls) {
-          toolCalls.push({
-            id: tc.id || `call_${generateShortId()}`,
-            type: "function",
-            function: {
-              name: tc.function?.name || tc.name,
-              arguments: typeof tc.function?.arguments === "string"
-                ? tc.function.arguments
-                : JSON.stringify(tc.function?.arguments || tc.arguments || {}),
-            },
-          });
-        }
-      } else if (j.name || j.function) {
-        toolCalls.push({
-          id: `call_${generateShortId()}`,
-          type: "function",
-          function: {
-            name: j.name || j.function,
-            arguments: typeof j.arguments === "string" ? j.arguments : JSON.stringify(j.arguments || {}),
-          },
-        });
-      }
-    } catch (_) {}
-  }
-
-  return toolCalls;
-}
-
-function removeToolCallsFromContent(content) {
-  let c = content || "";
-  c = c.replace(/```(?:json)?\s*\n?\s*\{[\s\S]*?"(?:name|tool_calls)"[\s\S]*?\}\s*\n?```/gi, "");
-  return c.replace(/\n{3,}/g, "\n\n").trim();
-}
-
-function formatOpenAIResponse(rawContent, model, requestId, stream = false, fullContent = null) {
+function formatOpenAIResponse(rawContent, model, requestId, stream = false) {
   const timestamp = Math.floor(Date.now() / 1000);
 
   if (stream) {
-    if (!fullContent) {
-      return {
-        id: `chatcmpl-${requestId}`,
-        object: "chat.completion.chunk",
-        created: timestamp,
-        model: model || config.qwen.defaultModel,
-        choices: [{ index: 0, delta: { content: rawContent }, finish_reason: null }],
-      };
-    }
-    const toolCalls = parseToolCalls(fullContent);
-    if (toolCalls.length > 0) {
-      return {
-        id: `chatcmpl-${requestId}`,
-        object: "chat.completion.chunk",
-        created: timestamp,
-        model: model || config.qwen.defaultModel,
-        choices: [{
-          index: 0,
-          delta: {
-            tool_calls: toolCalls.map((tc, idx) => ({
-              index: idx, id: tc.id, type: "function",
-              function: { name: tc.function.name, arguments: tc.function.arguments },
-            })),
-          },
-          finish_reason: "tool_calls",
-        }],
-      };
-    }
     return {
       id: `chatcmpl-${requestId}`,
       object: "chat.completion.chunk",
       created: timestamp,
       model: model || config.qwen.defaultModel,
-      choices: [{ index: 0, delta: { content: "" }, finish_reason: "stop" }],
+      choices: [{ index: 0, delta: { content: rawContent }, finish_reason: null }],
     };
   }
 
-  const toolCalls = parseToolCalls(rawContent);
-  const cleanContent = toolCalls.length > 0 ? removeToolCallsFromContent(rawContent) : rawContent;
   return {
     id: `chatcmpl-${requestId}`,
     object: "chat.completion",
@@ -782,10 +689,9 @@ function formatOpenAIResponse(rawContent, model, requestId, stream = false, full
       index: 0,
       message: {
         role: "assistant",
-        content: toolCalls.length > 0 ? (cleanContent || null) : cleanContent,
-        ...(toolCalls.length > 0 && { tool_calls: toolCalls }),
+        content: rawContent,
       },
-      finish_reason: toolCalls.length > 0 ? "tool_calls" : "stop",
+      finish_reason: "stop",
     }],
     usage: {
       prompt_tokens: estimateTokens(rawContent),
@@ -966,7 +872,6 @@ app.get("/status", (req, res) => {
     userId: session.userId ? session.userId.substring(0, 8) + "..." : null,
     activeSessions: sessions.size,
     features: session.features,
-    parseTool: config.parseTool,
   });
 });
 
@@ -1041,7 +946,7 @@ app.post("/v1/chat/completions", authMiddleware, async (req, res) => {
         res.write(`data: ${JSON.stringify(formatOpenAIResponse(remaining, reqModel, requestId, true))}\n\n`);
       }
 
-      res.write(`data: ${JSON.stringify(formatOpenAIResponse("", reqModel, requestId, true, fullContent))}\n\n`);
+      res.write(`data: ${JSON.stringify(formatOpenAIResponse("", reqModel, requestId, true))}\n\n`);
       res.write("data: [DONE]\n\n");
 
       if (session.features.persistHistory) {
