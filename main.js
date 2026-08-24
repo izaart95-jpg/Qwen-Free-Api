@@ -101,11 +101,23 @@ function estimateTokens(text) {
 }
 
 function qwenHeaders(extraHeaders = {}) {
+  // Optional extra cookies (QWEN_COOKIES env), e.g. a full browser cookie
+  // string — useful if upstream demands additional Aliyun context cookies.
+  const cookie = `token=${config.qwen.token}` +
+    (config.qwen.extraCookies ? `; ${config.qwen.extraCookies}` : "");
   return {
     "Content-Type": "application/json",
     "Accept": "*/*",
-    "Cookie": `token=${config.qwen.token}`,
+    "Cookie": cookie,
     "Authorization": `Bearer ${config.qwen.token}`,
+    // ── REQUIRED BY THE ALIYUN WAF ON chat.qwen.ai (verified empirically) ──
+    // POST /api/v2/chat/completions requires ALL THREE headers below;
+    // POST /api/v2/chats/new requires X-Request-Id.
+    // Missing any one → HTTP 200 with an HTML CAPTCHA challenge page
+    // (or RGV587_ERROR JSON) instead of the expected JSON/SSE response.
+    "X-Request-Id": generateId(),
+    "source": "web",
+    "X-Accel-Buffering": "no",
     ...extraHeaders,
   };
 }
@@ -128,6 +140,18 @@ async function createQwenChat(model) {
     body,
     signal: AbortSignal.timeout(15000),
   });
+
+  // Guard: WAF/bot challenges come back as HTTP 200 text/html — detect before .json()
+  const ct = res.headers.get("content-type") || "";
+  if (!ct.includes("application/json")) {
+    const txt = await res.text().catch(() => "");
+    const waf = /aliyun_waf|Access Verification|captcha/i.test(txt);
+    throw new Error(
+      `Qwen chat creation returned non-JSON response (${res.status} ${ct})` +
+      (waf ? " — WAF CAPTCHA challenge page" : "") +
+      `: ${txt.slice(0, 200)}`
+    );
+  }
 
   if (!res.ok) {
     const txt = await res.text().catch(() => "");
@@ -333,9 +357,9 @@ async function* sendToQwen(qwenMessages, opts = {}) {
   }
 
   const lastMsg = qwenMessages[qwenMessages.length - 1];
-  const parentId = (config.qwen.threadingEnabled !== false && session.features.threadingEnabled !== false)
+  const parentId = (config.parentIdControl !== false && session.features.threadingEnabled !== false)
     ? ((reqSession?.parentId) || null)
-    : null; // threadingEnabled=false: always null
+    : null; // threading off: always null
 
   // Update parent_id on the last message
   if (lastMsg) {
@@ -385,9 +409,15 @@ async function* sendToQwen(qwenMessages, opts = {}) {
   }
 
   const ct = res.headers.get("content-type") || "";
+  if (ct.includes("text/html")) {
+    const errBody = await res.text().catch(() => "");
+    throw new Error(`Qwen WAF CAPTCHA challenge page returned for chat completions (${res.status}). ${errBody.slice(0, 200)}`);
+  }
   if (ct.includes("application/json")) {
     const errBody = await res.text().catch(() => "");
-    throw new Error(`Qwen rejected request (200 JSON): ${errBody}`);
+    const wafHint = /RGV587|FAIL_SYS_USER_VALIDATE|punish|x5sec/i.test(errBody)
+      ? " — WAF/CAPTCHA challenge (RGV587)" : "";
+    throw new Error(`Qwen rejected request (200 JSON)${wafHint}: ${errBody.slice(0, 300)}`);
   }
 
   if (config.logging.level === "debug") {
@@ -495,7 +525,7 @@ async function* sendToQwen(qwenMessages, opts = {}) {
     }
   }
 
-  if (inThinkingBlock && opts.includeThinking) yield "\n</thinking>\n\n";
+  if (inThinkingBlock && includeThinking) yield "\n</thinking>\n\n";
 }
 
 // ============== FORMAT HELPERS ==============
