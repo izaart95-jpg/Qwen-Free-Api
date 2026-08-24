@@ -1,5 +1,5 @@
 {
-  "name": "qwen-bridge",
+  "name": "qwen-free",
   "version": "1.0.0",
   "description": "Qwen chat.qwen.ai proxy — OpenAI & Anthropic compatible",
   "main": "main.js",
