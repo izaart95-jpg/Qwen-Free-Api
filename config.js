@@ -13,6 +13,9 @@ module.exports = {
     token: process.env.QWEN_TOKEN || "YOUR_QWEN_TOKEN_HERE",
     baseUrl: "https://chat.qwen.ai",
     defaultModel: "qwen3.6-plus",
+    // Optional: raw cookie string (e.g. exported from your browser) merged
+    // into every outgoing Cookie header after `token=...`.
+    extraCookies: (process.env.QWEN_COOKIES || "").trim(),
   },
 
   // Auth for THIS proxy — clients must send this to talk to us
