@@ -24,7 +24,6 @@ const session = {
     researchMode: "advance",      // "normal" | "advance"
     persistHistory: false,
     threadingEnabled: false, // false=always null; true=auto-thread
-    includeThinkingInOutput: false, // stream thinking_summary content as <thinking> blocks
   },
 };
 
@@ -438,13 +437,19 @@ function buildQwenMessages(messages, system, model, opts = {}) {
 }
 
 // ============== SEND TO QWEN (streaming generator) ==============
+//
+// Yields structured parts:
+//   { reasoning: "..." } — thinking/reasoning blocks (thinking_summary phase)
+//   { content:   "..." } — normal answer text
+// The HTTP layer maps these onto the OpenAI format (reasoning_content / content),
+// GLM-style — no <thinking> XML wrapping.
 
 async function* sendToQwen(qwenMessages, opts = {}) {
   const {
     model = config.qwen.defaultModel,
     chatId: providedChatId = null,
     reqSession = null,
-    includeThinking = session.features.includeThinkingInOutput,
+    thinking = session.features.thinking,
   } = opts;
 
   if (!session.initialized) await initializeSession();
@@ -506,6 +511,7 @@ async function* sendToQwen(qwenMessages, opts = {}) {
   // frontend while we run, completions answer 200 JSON Bad_Request until we
   // refresh the header. We force-refresh the scraped version and try once more.
   let res = null;
+  let ct = "";
   while (true) {
     let r;
     try {
@@ -528,7 +534,7 @@ async function* sendToQwen(qwenMessages, opts = {}) {
       throw new Error(`Qwen error ${r.status}: ${errText}`);
     }
 
-    const ct = r.headers.get("content-type") || "";
+    ct = r.headers.get("content-type") || "";
     if (ct.includes("text/html")) {
       const errBody = await r.text().catch(() => "");
       throw new Error(`Qwen WAF CAPTCHA challenge page returned for chat completions (${r.status}). ${errBody.slice(0, 200)}`);
@@ -568,7 +574,6 @@ async function* sendToQwen(qwenMessages, opts = {}) {
   const decoder = new TextDecoder();
   let buffer = "";
   let responseId = null;
-  let inThinkingBlock = false;
 
   const reader = res.body.getReader();
 
@@ -613,31 +618,20 @@ async function* sendToQwen(qwenMessages, opts = {}) {
           const content = delta?.content;
 
           if (phase === "thinking_summary") {
-            if (includeThinking) {
-              if (status === "typing") {
-                const thoughtLines = delta?.extra?.summary_thought?.content;
-                if (Array.isArray(thoughtLines) && thoughtLines.length > 0) {
-                  if (!inThinkingBlock) {
-                    yield "<thinking>\n";
-                    inThinkingBlock = true;
-                  }
-                  yield thoughtLines.join("\n");
-                }
-              } else if (status === "finished" && inThinkingBlock) {
-                yield "\n</thinking>\n\n";
-                inThinkingBlock = false;
+            // Reasoning stream — forwarded to the caller as separate reasoning
+            // parts (surfaced as OpenAI `reasoning_content`, GLM-style) only
+            // when thinking is enabled. No XML wrapping anymore.
+            if (thinking && status === "typing") {
+              const thoughtLines = delta?.extra?.summary_thought?.content;
+              if (Array.isArray(thoughtLines) && thoughtLines.length > 0) {
+                yield { reasoning: thoughtLines.join("\n") };
               }
             }
             continue;
           }
 
-          if (inThinkingBlock && phase !== "thinking_summary") {
-            if (includeThinking) yield "\n</thinking>\n\n";
-            inThinkingBlock = false;
-          }
-
           if (content !== undefined && content !== null && content !== "") {
-            yield String(content);
+            yield { content: String(content) };
           }
 
         } catch (parseErr) {
@@ -657,28 +651,38 @@ async function* sendToQwen(qwenMessages, opts = {}) {
       try {
         const json = JSON.parse(dataStr);
         const c = json.choices?.[0]?.delta?.content;
-        if (c) yield String(c);
+        if (c) yield { content: String(c) };
       } catch (_) {}
     }
   }
-
-  if (inThinkingBlock && includeThinking) yield "\n</thinking>\n\n";
 }
 
 // ============== FORMAT HELPERS ==============
 
-function formatOpenAIResponse(rawContent, model, requestId, stream = false) {
+function formatOpenAIResponse(rawContent, model, requestId, stream = false, reasoning = null) {
   const timestamp = Math.floor(Date.now() / 1000);
 
   if (stream) {
+    // Reasoning chunks carry `reasoning_content` (GLM/DeepSeek-style);
+    // normal chunks carry `content`.
+    const delta = (reasoning !== null)
+      ? { reasoning_content: reasoning }
+      : { content: rawContent };
     return {
       id: `chatcmpl-${requestId}`,
       object: "chat.completion.chunk",
       created: timestamp,
       model: model || config.qwen.defaultModel,
-      choices: [{ index: 0, delta: { content: rawContent }, finish_reason: null }],
+      choices: [{ index: 0, delta, finish_reason: null }],
     };
   }
+
+  const message = {
+    role: "assistant",
+    content: rawContent,
+  };
+  // Only attach reasoning_content when the model actually produced reasoning
+  if (reasoning) message.reasoning_content = reasoning;
 
   return {
     id: `chatcmpl-${requestId}`,
@@ -687,10 +691,7 @@ function formatOpenAIResponse(rawContent, model, requestId, stream = false) {
     model: model || config.qwen.defaultModel,
     choices: [{
       index: 0,
-      message: {
-        role: "assistant",
-        content: rawContent,
-      },
+      message,
       finish_reason: "stop",
     }],
     usage: {
@@ -828,7 +829,7 @@ function getDashboardHTML(host) {
         <div class="section-label">Management</div>
         <div class="endpoint">
           <span class="method post">POST</span><span class="path">/features</span>
-          <div class="desc">Toggle: thinking, autoSearch, thinkingMode, researchMode, persistHistory, includeThinkingInOutput</div>
+          <div class="desc">Toggle: thinking, autoSearch, thinkingMode, researchMode, persistHistory</div>
         </div>
         <div class="endpoint">
           <span class="method post">POST</span><span class="path">/admin/session/clear</span>
@@ -912,7 +913,7 @@ app.post("/v1/chat/completions", authMiddleware, async (req, res) => {
   const sendOpts = {
     model: qwenModel,
     reqSession,
-    includeThinking: session.features.includeThinkingInOutput,
+    thinking: overrideOpts.thinking,
   };
 
   if (stream) {
@@ -929,21 +930,16 @@ app.post("/v1/chat/completions", authMiddleware, async (req, res) => {
     }, 8000);
 
     let fullContent = "";
-    let sentContent = "";
 
     try {
-      for await (const chunk of sendToQwen(qwenMsgs, sendOpts)) {
-        fullContent += chunk;
-        const delta = fullContent.substring(sentContent.length);
-        if (delta) {
-          sentContent = fullContent;
-          res.write(`data: ${JSON.stringify(formatOpenAIResponse(delta, reqModel, requestId, true))}\n\n`);
+      for await (const part of sendToQwen(qwenMsgs, sendOpts)) {
+        if (part.reasoning) {
+          // Reasoning delta — OpenAI reasoning_content format (GLM-style)
+          res.write(`data: ${JSON.stringify(formatOpenAIResponse("", reqModel, requestId, true, part.reasoning))}\n\n`);
+        } else if (part.content) {
+          fullContent += part.content;
+          res.write(`data: ${JSON.stringify(formatOpenAIResponse(part.content, reqModel, requestId, true))}\n\n`);
         }
-      }
-
-      const remaining = fullContent.substring(sentContent.length);
-      if (remaining) {
-        res.write(`data: ${JSON.stringify(formatOpenAIResponse(remaining, reqModel, requestId, true))}\n\n`);
       }
 
       res.write(`data: ${JSON.stringify(formatOpenAIResponse("", reqModel, requestId, true))}\n\n`);
@@ -966,8 +962,10 @@ app.post("/v1/chat/completions", authMiddleware, async (req, res) => {
   } else {
     try {
       let fullContent = "";
-      for await (const chunk of sendToQwen(qwenMsgs, sendOpts)) {
-        fullContent += chunk;
+      let fullReasoning = "";
+      for await (const part of sendToQwen(qwenMsgs, sendOpts)) {
+        if (part.reasoning) fullReasoning += part.reasoning;
+        else if (part.content) fullContent += part.content;
       }
 
       if (session.features.persistHistory) {
@@ -975,7 +973,7 @@ app.post("/v1/chat/completions", authMiddleware, async (req, res) => {
         if (fullContent) reqSession.messages.push({ role: "assistant", content: fullContent });
       }
 
-      res.json(formatOpenAIResponse(fullContent, reqModel, requestId));
+      res.json(formatOpenAIResponse(fullContent, reqModel, requestId, false, fullReasoning || null));
     } catch (e) {
       console.error("[OAI API] Error:", e.message);
       const status = e.message.includes("401") ? 401 : 500;
@@ -1033,7 +1031,6 @@ app.post("/features", authMiddleware, (req, res) => {
     thinkingMode,
     researchMode,
     persistHistory,
-    includeThinkingInOutput,
   } = req.body;
 
   const validThinkingModes = ["Thinking", "Fast"];
@@ -1042,7 +1039,6 @@ app.post("/features", authMiddleware, (req, res) => {
   if (thinking !== undefined) session.features.thinking = !!thinking;
   if (autoSearch !== undefined) session.features.autoSearch = !!autoSearch;
   if (persistHistory !== undefined) session.features.persistHistory = !!persistHistory;
-  if (includeThinkingInOutput !== undefined) session.features.includeThinkingInOutput = !!includeThinkingInOutput;
   if (threadingEnabled !== undefined) { session.features.threadingEnabled = !!threadingEnabled; if (!threadingEnabled) { for (const s of sessions.values()) s.parentId = null; } }
 
   if (thinkingMode !== undefined) {
