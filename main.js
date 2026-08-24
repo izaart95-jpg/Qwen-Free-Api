@@ -100,21 +100,74 @@ function estimateTokens(text) {
   return Math.ceil((text || "").length / 4);
 }
 
+function qwenCookie() {
+  // The JWT must be sent as the `token` COOKIE — this is what passes the Aliyun
+  // WAF on /api/v2/chat/completions (verified empirically 2026-08-24):
+  //   - Authorization: Bearer alone        → WAF CAPTCHA punish page (HTTP 200 text/html)
+  //   - User-Agent alone                   → WAF CAPTCHA punish page
+  //   - Cookie: token=<jwt>                → passes WAF, backend reads the JWT from it
+  const parts = [`token=${config.qwen.token}`];
+  const extra = (config.qwen.extraCookies || "").trim().replace(/^;+|;+$/g, "");
+  if (extra) parts.push(extra);
+  return parts.join("; ");
+}
+
 function qwenHeaders(extraHeaders = {}) {
   return {
     "Content-Type": "application/json",
-    "Accept": "*/*",
-    "Authorization": `Bearer ${config.qwen.token}`,
-    // ── REQUIRED BY THE ALIYUN WAF ON chat.qwen.ai (verified empirically) ──
-    // POST /api/v2/chat/completions requires ALL THREE headers below;
-    // POST /api/v2/chats/new requires X-Request-Id.
-    // Missing any one → HTTP 200 with an HTML CAPTCHA challenge page
-    // (or RGV587_ERROR JSON) instead of the expected JSON/SSE response.
+    "Accept": "application/json",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Connection": "keep-alive",
+    "User-Agent": config.qwen.userAgent,
+    // ── REQUIRED BY THE ALIYUN WAF ON chat.qwen.ai ──
+    // Auth goes via the `token` cookie above (NOT a Bearer header).
+    // X-Request-Id + source are required by /api/v2/chats/new.
+    // Missing any of this browser-like set → HTTP 200 text/html CAPTCHA page
+    // (_____tmd_____/punish?x5secdata=...) or RGV587_ERROR instead of JSON/SSE.
+    "Cookie": qwenCookie(),
     "X-Request-Id": generateId(),
     "source": "web",
     "X-Accel-Buffering": "no",
     ...extraHeaders,
   };
+}
+
+// ============== WAF CHALLENGE DETECTION & RETRY ==============
+
+const WAF_MARKERS = /aliyun_waf|Access[_ ]?Verification|captcha|_____tmd_____|x5secdata|x5referer/i;
+
+function isWafChallenge(res) {
+  const ct = res.headers.get("content-type") || "";
+  return ct.includes("text/html");
+}
+
+async function fetchQwen(url, options = {}, { timeoutMs = 30000 } = {}) {
+  const retries = Math.max(0, config.qwen.wafRetries ?? 2);
+  let lastErr = null;
+
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    let res;
+    try {
+      res = await fetch(url, { ...options, signal: AbortSignal.timeout(timeoutMs) });
+    } catch (e) {
+      throw new Error(`Qwen connection error: ${e.message}`);
+    }
+
+    if (!isWafChallenge(res)) return res;
+
+    const body = await res.text().catch(() => "");
+    lastErr = new Error(
+      `Qwen WAF CAPTCHA challenge page returned (${res.status})` +
+      `${WAF_MARKERS.test(body) ? "" : " [unrecognized HTML]"}: ${body.slice(0, 160)}`
+    );
+    if (attempt < retries) {
+      console.warn(`[WAF] Challenge served for ${new URL(url).pathname} (attempt ${attempt + 1}/${retries + 1}) — retrying...`);
+      await new Promise(r => setTimeout(r, 1500 * (attempt + 1)));
+      // Fresh X-Request-Id per attempt
+      if (options.headers) options.headers["X-Request-Id"] = generateId();
+    }
+  }
+  throw lastErr;
 }
 
 // ============== QWEN CHAT CREATION ==============
@@ -129,14 +182,13 @@ async function createQwenChat(model) {
     project_id: "",
   });
 
-  const res = await fetch(`${BASE_URL}/api/v2/chats/new`, {
+  const res = await fetchQwen(`${BASE_URL}/api/v2/chats/new`, {
     method: "POST",
     headers: qwenHeaders(),
     body,
-    signal: AbortSignal.timeout(15000),
-  });
+  }, { timeoutMs: 15000 });
 
-  // Guard: WAF/bot challenges come back as HTTP 200 text/html — detect before .json()
+  // Belt-and-braces: WAF/bot challenges come back as HTTP 200 text/html
   const ct = res.headers.get("content-type") || "";
   if (!ct.includes("application/json")) {
     const txt = await res.text().catch(() => "");
@@ -188,10 +240,9 @@ async function initializeSession() {
     }
 
     // Quick ping to verify token is valid
-    const res = await fetch(`${BASE_URL}/api/v2/configs/`, {
+    const res = await fetchQwen(`${BASE_URL}/api/v2/configs/`, {
       headers: qwenHeaders(),
-      signal: AbortSignal.timeout(10000),
-    });
+    }, { timeoutMs: 10000 });
 
     if (res.status === 401) {
       throw new Error("Qwen token is invalid or expired (401)");
@@ -362,11 +413,21 @@ async function* sendToQwen(qwenMessages, opts = {}) {
     lastMsg.parentId = parentId;
   }
 
+  // Give every message a browser-shaped identity (matches the verified-working
+  // request: UUID fid, id:null, childrenIds populated)
+  for (const m of qwenMessages) {
+    if (!m.fid) m.fid = generateId();
+    if (!("id" in m)) m.id = null;
+    if (!Array.isArray(m.childrenIds)) m.childrenIds = [];
+  }
+
   const body = JSON.stringify({
     stream: true,
     version: "2.1",
     incremental_output: true,
+    chatId,
     chat_id: chatId,
+    parentId: parentId ?? "",
     chat_mode: "normal",
     model,
     parent_id: parentId,
@@ -383,12 +444,11 @@ async function* sendToQwen(qwenMessages, opts = {}) {
 
   let res;
   try {
-    res = await fetch(url, {
+    res = await fetchQwen(url, {
       method: "POST",
       headers,
       body,
-      signal: AbortSignal.timeout(120000),
-    });
+    }, { timeoutMs: 120000 });
   } catch (e) {
     throw new Error(`Qwen connection error: ${e.message}`);
   }
@@ -412,7 +472,12 @@ async function* sendToQwen(qwenMessages, opts = {}) {
     const errBody = await res.text().catch(() => "");
     const wafHint = /RGV587|FAIL_SYS_USER_VALIDATE|punish|x5sec/i.test(errBody)
       ? " — WAF/CAPTCHA challenge (RGV587)" : "";
-    throw new Error(`Qwen rejected request (200 JSON)${wafHint}: ${errBody.slice(0, 300)}`);
+    let qwenCode = "";
+    try {
+      const j = JSON.parse(errBody);
+      if (j?.data?.code) qwenCode = ` [${j.data.code}] ${j.data.details || ""}`;
+    } catch (_) {}
+    throw new Error(`Qwen rejected request (200 JSON)${wafHint}${qwenCode}: ${errBody.slice(0, 300)}`);
   }
 
   if (config.logging.level === "debug") {
@@ -694,8 +759,10 @@ function formatOpenAIError(message, type = "api_error") {
 
 function mapToQwenModel(modelName) {
   const m = (modelName || "").toLowerCase();
-  if (m.includes("opus") || m.includes("max")) return "qwen3.6-max-preview";
-  if (m.includes("haiku") || m.includes("flash")) return "qwen3.5-flash";
+  // Live Qwen models (verified via /api/v2/models): qwen3.7-plus, qwen3.8-max,
+  // qwen3.7-max, qwen3.6-plus, qwen3.5-plus, qwen3.5-omni-plus
+  if (m.includes("opus") || m.includes("max")) return "qwen3.8-max";
+  if (m.includes("haiku") || m.includes("flash")) return "qwen3.5-plus";
   if (m.includes("coder") || m.includes("code")) return "qwen3-coder-plus";
   if (m.includes("qwen")) return modelName; // pass qwen models through directly
   return config.qwen.defaultModel; // default: qwen3.6-plus
@@ -1147,10 +1214,9 @@ app.get("/v1/models", authMiddleware, async (req, res) => {
 
   let qwenModels = [];
   try {
-    const r = await fetch(`${BASE_URL}/api/v2/models/`, {
+    const r = await fetchQwen(`${BASE_URL}/api/v2/models/`, {
       headers: qwenHeaders(),
-      signal: AbortSignal.timeout(10000),
-    });
+    }, { timeoutMs: 10000 });
     if (r.ok) {
       const data = await r.json();
       if (data.success && Array.isArray(data.data?.data)) {
