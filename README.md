@@ -110,6 +110,7 @@ curl -X POST http://localhost:3456/features \
 
 ## Notes
 
+- **WAF**: chat.qwen.ai's Aliyun WAF requires the JWT to be sent as the `token` **cookie** plus a browser `User-Agent` on `/api/v2/chat/completions`. A `Authorization: Bearer` header or non-browser UA gets an HTTP 200 HTML CAPTCHA (`_____tmd_____/punish?x5secdata=...`) instead of JSON/SSE. This proxy sends cookie auth + Chrome UA by default; override via `QWEN_USER_AGENT` / `QWEN_COOKIES`, tune retries with `QWEN_WAF_RETRIES`.
 - Each proxy session gets its own Qwen `chat_id` (created lazily on first request)
 - Switching `chatType` via `/features` clears all sessions so new chats use the new type
 - `x-session-id` header lets clients maintain separate conversation threads
