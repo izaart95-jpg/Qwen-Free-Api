@@ -1,7 +1,7 @@
 {
   "name": "qwen-free",
   "version": "1.0.0",
-  "description": "Qwen chat.qwen.ai proxy — OpenAI & Anthropic compatible",
+  "description": "Qwen chat.qwen.ai proxy — OpenAI compatible",
   "main": "main.js",
   "scripts": {
     "start": "node main.js",
