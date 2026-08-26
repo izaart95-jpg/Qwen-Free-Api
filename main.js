@@ -17,6 +17,15 @@ const BASE_URL = config.qwen.baseUrl;
 // below, which is converted back to OpenAI tool_calls on the way out.
 const agentMode = process.argv.includes("--agent-mode") ||
   /^(1|true|yes|on)$/i.test(String(process.env.AGENT_MODE || ""));
+
+// Debug mode: --debug flag or DEBUG=true env var. When enabled, every request
+// sent to the Qwen API (URL/method/headers/payload) and everything received
+// back (status/headers/body chunks) is printed to stdout.
+const debugMode = process.argv.includes("--debug") ||
+  /^(1|true|yes|on)$/i.test(String(process.env.DEBUG || ""));
+function debugLog(...args) {
+  if (debugMode) console.log("[DEBUG]", ...args);
+}
 const AGENT_TOOL_START = "<<<TOOL_CALL>>>";
 const AGENT_TOOL_END = "<<<END_TOOL_CALL>>>";
 const AGENT_SYSTEM_PREFIX = `[SYSTEM] — READ THIS ENTIRE BLOCK BEFORE DOING ANYTHING ELSE
@@ -164,8 +173,7 @@ const session = {
     thinking: true,
     autoSearch: true,
     thinkingMode: "Thinking",    // "Thinking" | "Fast"
-    researchMode: "advance",      // "normal" | "advance"
-    persistHistory: false,
+    researchMode: "advance",     // "normal" | "advance"
     threadingEnabled: false, // false=always null; true=auto-thread
   },
 };
@@ -183,7 +191,6 @@ function getOrCreateSession(req) {
     sessions.set(sessionId, {
       chatId: null,        // created lazily on first request
       parentId: null,      // last message's fid (for threading)
-      messages: [],
       lastUsed: Date.now(),
     });
   }
@@ -351,6 +358,19 @@ function isWafChallenge(res) {
   return ct.includes("text/html");
 }
 
+// Debug mode: log every request sent to Qwen and tee every response chunk to
+// stdout while still returning a fully usable Response.
+function debugTeeResponse(res) {
+  if (!debugMode || !res.body) return res;
+  const stream = res.body.pipeThrough(new TransformStream({
+    transform(chunk, controller) {
+      console.log("[DEBUG] ← response body:", JSON.stringify(Buffer.from(chunk).toString("utf8")));
+      controller.enqueue(chunk);
+    },
+  }));
+  return new Response(stream, { status: res.status, statusText: res.statusText, headers: res.headers });
+}
+
 async function fetchQwen(url, options = {}, { timeoutMs = 30000 } = {}) {
   const retries = Math.max(0, config.qwen.wafRetries ?? 2);
   let lastErr = null;
@@ -358,12 +378,25 @@ async function fetchQwen(url, options = {}, { timeoutMs = 30000 } = {}) {
   for (let attempt = 0; attempt <= retries; attempt++) {
     let res;
     try {
+      if (debugMode) {
+        const { method = "GET", headers = {}, body } = options;
+        console.log(`[DEBUG] → REQUEST ${method} ${url} (attempt ${attempt + 1}/${retries + 1})`);
+        console.log("[DEBUG] → request headers:", JSON.stringify(headers, null, 2));
+        if (body != null) console.log("[DEBUG] → request payload:", typeof body === "string" ? body : JSON.stringify(body));
+      }
       res = await fetch(url, { ...options, signal: AbortSignal.timeout(timeoutMs) });
     } catch (e) {
       throw new Error(`Qwen connection error: ${e.message}`);
     }
 
-    if (!isWafChallenge(res)) return res;
+    if (debugMode) {
+      const resHeaders = {};
+      res.headers.forEach((v, k) => { resHeaders[k] = v; });
+      console.log(`[DEBUG] ← RESPONSE ${res.status} ${res.statusText}`);
+      console.log("[DEBUG] ← response headers:", JSON.stringify(resHeaders, null, 2));
+    }
+
+    if (!isWafChallenge(res)) return debugTeeResponse(res);
 
     const body = await res.text().catch(() => "");
     lastErr = new Error(
@@ -473,25 +506,6 @@ async function initializeSession() {
 }
 
 // ============== MESSAGE CONVERSION ==============
-
-// Convert OpenAI messages to flat text for logging (not sent to Qwen)
-function messagesToText(messages) {
-  if (!Array.isArray(messages)) return String(messages || "");
-  return messages.map(m => {
-    const content = m.content;
-    if (typeof content === "string") return content;
-    if (Array.isArray(content)) {
-      return content
-        .filter(b => b.type === "text" || typeof b === "string")
-        .map(b => {
-          if (typeof b === "string") return b;
-          return b.text || "";
-        })
-        .join("\n");
-    }
-    return String(content || "");
-  }).join("\n\n");
-}
 
 // Convert OpenAI messages + system → Qwen messages array
 // Qwen expects: role, content (string), plus our extra metadata fields
@@ -644,10 +658,6 @@ async function* sendToQwen(qwenMessages, opts = {}) {
     timestamp: Math.floor(Date.now() / 1000),
   });
 
-  if (config.logging.level === "debug") {
-    console.log("[DEBUG] Qwen request body:", body);
-  }
-
   const url = `${BASE_URL}/api/v2/chat/completions?chat_id=${chatId}`;
 
   // One retry reserved for the stale-`Version` signature: if Qwen bumps its
@@ -706,10 +716,6 @@ async function* sendToQwen(qwenMessages, opts = {}) {
     break;
   }
 
-  if (config.logging.level === "debug") {
-    console.log(`[Qwen] Response status=${res.status} content-type=${ct}`);
-  }
-
   if (!res.body) {
     throw new Error("Qwen returned response with null body — cannot stream");
   }
@@ -731,10 +737,6 @@ async function* sendToQwen(qwenMessages, opts = {}) {
 
       for (const line of lines) {
         const trimmed = line.trim();
-
-        if (config.logging.level === "debug") {
-          console.log("[RAW SSE]", JSON.stringify(trimmed));
-        }
 
         if (!trimmed || !trimmed.startsWith("data: ")) continue;
         const dataStr = trimmed.slice(6);
@@ -778,9 +780,7 @@ async function* sendToQwen(qwenMessages, opts = {}) {
           }
 
         } catch (parseErr) {
-          if (config.logging.level === "debug") {
-            console.warn("[SSE parse error]", parseErr.message);
-          }
+          debugLog("[SSE parse error]", parseErr.message);
         }
       }
     }
@@ -862,143 +862,28 @@ function mapToQwenModel(modelName) {
   return config.qwen.defaultModel; // default: qwen3.6-plus
 }
 
-// ============== DASHBOARD HTML ==============
+// ============== UI (minimal: health + threading button) ==============
 
-function getDashboardHTML(host) {
+function getUIHTML() {
   return `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Qwen Bridge</title>
-  <style>
-    * { margin: 0; padding: 0; box-sizing: border-box; }
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-      background: linear-gradient(135deg, #0f2027 0%, #203a43 50%, #2c5364 100%);
-      min-height: 100vh; color: #e0e0e0; padding: 20px;
-    }
-    .container { max-width: 1100px; margin: 0 auto; }
-    .header {
-      text-align: center; padding: 40px 20px;
-      background: rgba(255,255,255,0.05); border-radius: 16px;
-      margin-bottom: 30px; border: 1px solid rgba(255,255,255,0.1);
-    }
-    .header h1 {
-      font-size: 2.5rem;
-      background: linear-gradient(135deg, #56ccf2, #2f80ed);
-      -webkit-background-clip: text; -webkit-text-fill-color: transparent;
-      margin-bottom: 10px;
-    }
-    .header p { color: #888; font-size: 1.1rem; }
-    .badges { display: flex; gap: 8px; justify-content: center; margin-top: 12px; flex-wrap: wrap; }
-    .badge { display: inline-block; padding: 4px 12px; border-radius: 12px; font-size: 0.8rem; font-weight: 700; }
-    .badge-green { background: #22c55e; color: #000; }
-    .badge-blue  { background: #2f80ed; color: #fff; }
-    .badge-orange{ background: #f59e0b; color: #000; }
-    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 20px; }
-    .card {
-      background: rgba(255,255,255,0.05); border-radius: 12px;
-      padding: 24px; border: 1px solid rgba(255,255,255,0.1);
-    }
-    .card h2 { color: #56ccf2; margin-bottom: 16px; font-size: 1.2rem; }
-    .stat-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; }
-    .stat { background: rgba(0,0,0,0.2); padding: 12px; border-radius: 8px; }
-    .stat .label { color: #888; font-size: 0.85rem; }
-    .stat .value { color: #56ccf2; font-weight: 600; font-size: 1.3rem; margin-top: 4px; }
-    .code-block {
-      background: #0d1117; border-radius: 8px; padding: 16px; overflow-x: auto;
-      font-family: 'Monaco', 'Menlo', monospace; font-size: 0.82rem;
-      border: 1px solid #30363d; margin: 12px 0;
-    }
-    .code-block code { color: #c9d1d9; white-space: pre-wrap; }
-    .endpoint { background: rgba(0,0,0,0.2); padding: 12px; border-radius: 8px; margin-bottom: 8px; }
-    .method { display: inline-block; padding: 4px 8px; border-radius: 4px; font-size: 0.75rem; font-weight: 600; margin-right: 8px; }
-    .method.get { background: #22c55e; color: #000; }
-    .method.post { background: #2f80ed; color: #fff; }
-    .path { font-family: monospace; color: #e0e0e0; }
-    .desc { color: #888; font-size: 0.85rem; margin-top: 4px; }
-    .section-label { font-size: 0.75rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.1em; color: #a855f7; margin: 16px 0 8px; }
-  </style>
-</head>
+<html>
+<head><meta charset="utf-8"><title>Qwen Bridge</title></head>
 <body>
-  <div class="container">
-    <div class="header">
-      <h1>Qwen Bridge</h1>
-      <p>Proxy for chat.qwen.ai — OpenAI compatible</p>
-      <div class="badges">
-        <span class="badge badge-green">⚡ Direct Mode</span>
-        <span class="badge badge-blue">OpenAI Compatible</span>
-        <span class="badge badge-orange">Qwen Native</span>
-      </div>
-    </div>
+<h1>Qwen Bridge</h1>
+<p id="health">Health: checking...</p>
+<p><button onclick="enableThreading()">Enable Threading</button> <span id="threadStatus"></span></p>
+<script>
+fetch('/admin/health').then(r => {
+  document.getElementById('health').textContent = 'Health: ' + (r.ok ? 'healthy' : 'unhealthy');
+}).catch(() => { document.getElementById('health').textContent = 'Health: unreachable'; });
 
-    <div class="grid">
-      <div class="card">
-        <h2>Status</h2>
-        <div class="stat-grid">
-          <div class="stat"><div class="label">Token</div><div class="value" id="tokenStatus">...</div></div>
-          <div class="stat"><div class="label">User ID</div><div class="value" id="userId" style="font-size:0.8rem">...</div></div>
-          <div class="stat"><div class="label">Sessions</div><div class="value" id="sessions">0</div></div>
-          <div class="stat"><div class="label">Chat Type</div><div class="value">t2t</div></div>
-        </div>
-      </div>
-
-      <div class="card">
-        <h2>Features</h2>
-        <div class="stat-grid">
-          <div class="stat"><div class="label">Thinking</div><div class="value" id="featThinking">ON</div></div>
-          <div class="stat"><div class="label">Auto Search</div><div class="value" id="featSearch">ON</div></div>
-          <div class="stat"><div class="label">Mode</div><div class="value" id="featThinkMode">Thinking</div></div>
-          <div class="stat"><div class="label">Research</div><div class="value" id="featResearch">normal</div></div>
-        </div>
-      </div>
-
-      <div class="card" style="grid-column: span 2;">
-        <h2>API Endpoints</h2>
-
-        <div class="section-label">OpenAI-Compatible</div>
-        <div class="endpoint">
-          <span class="method post">POST</span><span class="path">/v1/chat/completions</span>
-          <div class="desc">OpenAI chat endpoint. Supports streaming.</div>
-        </div>
-
-        <div class="section-label">Models</div>
-        <div class="endpoint">
-          <span class="method get">GET</span><span class="path">/v1/models</span>
-          <div class="desc">Lists Qwen models (fetched live from chat.qwen.ai)</div>
-        </div>
-
-        <div class="section-label">Management</div>
-        <div class="endpoint">
-          <span class="method post">POST</span><span class="path">/features</span>
-          <div class="desc">Toggle: thinking, autoSearch, thinkingMode, researchMode, persistHistory</div>
-        </div>
-        <div class="endpoint">
-          <span class="method post">POST</span><span class="path">/admin/session/clear</span>
-          <div class="desc">Clear all session histories and chat IDs</div>
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <script>
-    async function updateStatus() {
-      try {
-        const r = await fetch('/status');
-        const d = await r.json();
-        document.getElementById('tokenStatus').textContent = d.tokenValid ? '✓ Valid' : '✗ Invalid';
-        document.getElementById('userId').textContent = d.userId || '-';
-        document.getElementById('sessions').textContent = d.activeSessions;
-        document.getElementById('featThinking').textContent = d.features?.thinking ? 'ON' : 'OFF';
-        document.getElementById('featSearch').textContent = d.features?.autoSearch ? 'ON' : 'OFF';
-        document.getElementById('featThinkMode').textContent = d.features?.thinkingMode || '-';
-        document.getElementById('featResearch').textContent = d.features?.researchMode || '-';
-      } catch(e) { console.error(e); }
-    }
-    updateStatus();
-    setInterval(updateStatus, 4000);
-  </script>
+function enableThreading() {
+  fetch('/threading', { method: 'POST' }).then(r => r.json()).then(d => {
+    document.getElementById('threadStatus').textContent =
+      d.features && d.features.threadingEnabled ? 'threading enabled' : 'failed';
+  }).catch(() => { document.getElementById('threadStatus').textContent = 'error'; });
+}
+</script>
 </body>
 </html>`;
 }
@@ -1006,8 +891,15 @@ function getDashboardHTML(host) {
 // ============== ROUTES ==============
 
 app.get("/", (req, res) => {
-  const host = req.headers.host || `localhost:${config.server.port}`;
-  res.send(getDashboardHTML(host));
+  res.type("html").send(getUIHTML());
+});
+
+// Enable threading (used by the UI button). Deliberately unauthenticated so the
+// button works out of the box; it can only turn threading ON, never off.
+app.post("/threading", (req, res) => {
+  session.features.threadingEnabled = true;
+  console.log("[Features] Threading enabled via UI button");
+  res.json({ success: true, features: session.features });
 });
 
 app.get("/status", (req, res) => {
@@ -1109,12 +1001,6 @@ app.post("/v1/chat/completions", authMiddleware, async (req, res) => {
       }
       if (!emittedToolCall) res.write(`data: ${JSON.stringify(formatOpenAIResponse("", reqModel, requestId, true))}\n\n`);
       res.write("data: [DONE]\n\n");
-
-      if (session.features.persistHistory) {
-        reqSession.messages.push({ role: "user", content: messagesToText(userMessages) });
-        if (fullContent) reqSession.messages.push({ role: "assistant", content: fullContent });
-      }
-
     } catch (e) {
       console.error("[OAI Stream] Error:", e.message);
       res.write(`data: ${JSON.stringify({ error: { message: e.message } })}\n\n`);
@@ -1131,11 +1017,6 @@ app.post("/v1/chat/completions", authMiddleware, async (req, res) => {
       for await (const part of sendToQwen(qwenMsgs, sendOpts)) {
         if (part.reasoning) fullReasoning += part.reasoning;
         else if (part.content) fullContent += part.content;
-      }
-
-      if (session.features.persistHistory) {
-        reqSession.messages.push({ role: "user", content: messagesToText(userMessages) });
-        if (fullContent) reqSession.messages.push({ role: "assistant", content: fullContent });
       }
 
       if (agentMode) {
@@ -1205,7 +1086,6 @@ app.post("/features", authMiddleware, (req, res) => {
     autoSearch,
     thinkingMode,
     researchMode,
-    persistHistory,
   } = req.body;
 
   const validThinkingModes = ["Thinking", "Fast"];
@@ -1213,7 +1093,6 @@ app.post("/features", authMiddleware, (req, res) => {
 
   if (thinking !== undefined) session.features.thinking = !!thinking;
   if (autoSearch !== undefined) session.features.autoSearch = !!autoSearch;
-  if (persistHistory !== undefined) session.features.persistHistory = !!persistHistory;
   if (threadingEnabled !== undefined) { session.features.threadingEnabled = !!threadingEnabled; if (!threadingEnabled) { for (const s of sessions.values()) s.parentId = null; } }
 
   if (thinkingMode !== undefined) {
@@ -1250,11 +1129,8 @@ app.get("/admin/health", (req, res) => {
 });
 
 app.get("/admin/stats", (req, res) => {
-  let totalMessages = 0;
-  for (const s of sessions.values()) totalMessages += s.messages.length;
   res.json({
     activeSessions: sessions.size,
-    totalMessages,
     features: session.features,
   });
 });
@@ -1264,11 +1140,12 @@ app.get("/admin/stats", (req, res) => {
 server.listen(config.server.port, config.server.host, async () => {
   const port = config.server.port;
   console.log(`[Mode] Agent mode ${agentMode ? "ENABLED" : "disabled"}: ${agentMode ? "OpenAI tools/roles translated and tool calls intercepted" : "direct Qwen mode"}`);
+  console.log(`[Mode] Debug mode ${debugMode ? "ENABLED" : "disabled"}${debugMode ? "" : ": start with --debug or DEBUG=true to dump Qwen requests/responses"}`);
   console.log(`
 ╔══════════════════════════════════════════════════════════════╗
 ║                  Qwen Bridge Server Started                  ║
 ╠══════════════════════════════════════════════════════════════╣
-║  Dashboard:       http://localhost:${String(port).padEnd(26)}║
+║  UI:              http://localhost:${String(port).padEnd(26)}║
 ║  OpenAI API:      http://localhost:${port}/v1/chat/completions ║
 ╠══════════════════════════════════════════════════════════════╣
 ║  Auth Token:      ${config.auth.token.padEnd(43)}║

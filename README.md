@@ -15,7 +15,8 @@ An **OpenAI-compatible** API proxy for [chat.qwen.ai](https://chat.qwen.ai). Dro
 - **Thinking summaries** — Qwen's `thinking_summary` phase can be streamed as `reasoning_content` blocks
 - **Live model list** — Models fetched from Qwen's `/api/v2/models` (falls back to a static list)
 - **Runtime feature toggles** — Flip thinking, auto-search, threading, research mode, and more via `POST /features`
-- **Built-in dashboard** — `GET /` serves a status page (token validity, sessions, feature flags)
+- **Debug mode** — `node main.js --debug` (or `DEBUG=true`) dumps every Qwen request (URL, headers, payload) and response (status, headers, body) to stdout
+- **Built-in UI** — `GET /` serves a bare-bones health page with an Enable-Threading button
 
 ---
 
@@ -102,13 +103,13 @@ node main.js
 #   npm run dev
 ```
 
-On startup, you'll see a banner with your dashboard URL, the OpenAI endpoint, and the auth token. The Qwen token is validated asynchronously — if startup validation fails, the first chat request will retry it.
+On startup, you'll see a banner with your UI URL, the OpenAI endpoint, and the auth token. The Qwen token is validated asynchronously — if startup validation fails, the first chat request will retry it.
 
 ---
 
 ## Configuration
 
-All configuration is environment-driven (see `config.js`). No CLI flags.
+All configuration is environment-driven (see `config.js`). One CLI flag exists: `--debug`.
 
 ### Environment Variables
 
@@ -122,7 +123,13 @@ All configuration is environment-driven (see `config.js`). No CLI flags.
 | `QWEN_USER_AGENT` | *(Chrome UA)* | Browser User-Agent — **required** to pass the Aliyun WAF; non-browser UAs get a CAPTCHA punish page |
 | `QWEN_WAF_RETRIES` | `2` | How many times to retry when the WAF serves its challenge page anyway |
 | `QWEN_FE_VERSION` | `auto` | Pin the frontend `Version` header (e.g. `0.2.87`) to skip scraping; `auto` scrapes + self-heals |
-| `LOG_LEVEL` | `info` | Log level — `debug` dumps every Qwen request body and raw SSE line |
+| `DEBUG` | *(unset)* | Truthy value (`1`/`true`/`yes`/`on`) enables debug logging — same as the `--debug` flag |
+
+### CLI Flags
+
+| Flag | Description |
+|---|---|
+| `--debug` | Dump every Qwen request (method, URL, headers, payload) and response (status, headers, body chunks) to stdout |
 
 ### `config.js` options (file-level)
 
@@ -169,12 +176,13 @@ System messages are folded into the first user message before being sent upstrea
 
 | Method | Path | Auth | Description |
 |---|---|---|---|
-| `GET`  | `/` | ❌ | HTML dashboard — token status, sessions, feature flags |
+| `GET`  | `/` | ❌ | Minimal UI — health status + Enable-Threading button (no styling) |
+| `POST` | `/threading` | ❌ | Turn threading on (what the UI button calls); can only enable, never disable |
 | `GET`  | `/status` | ❌ | JSON status (`tokenValid`, `userId`, `activeSessions`, `features`) |
 | `POST` | `/features` | ✅ | Runtime feature toggles (see below) |
-| `POST` | `/admin/session/clear` | ✅ | Clear all session histories and chat IDs |
+| `POST` | `/admin/session/clear` | ✅ | Clear all sessions and chat IDs |
 | `GET`  | `/admin/health` | ❌ | Health check (`200` if the token is initialised, else `503`) |
-| `GET`  | `/admin/stats` | ❌ | `activeSessions`, `totalMessages`, current `features` |
+| `GET`  | `/admin/stats` | ❌ | `activeSessions`, current `features` |
 
 ---
 
@@ -199,7 +207,6 @@ Response:
     "autoSearch": true,
     "thinkingMode": "Thinking",
     "researchMode": "advance",
-    "persistHistory": false,
     "threadingEnabled": false
   }
 }
@@ -214,7 +221,6 @@ Response:
 | `thinkingMode` | `"Thinking"` \| `"Fast"` | Deep-thinking vs fast mode (invalid values → `400`) |
 | `researchMode` | `"normal"` \| `"advance"` | Research depth (invalid values → `400`) |
 | `threadingEnabled` | bool | Chain requests via `parent_id`; disabling resets all stored parents |
-| `persistHistory` | bool | Keep request/response pairs for `/admin/stats` (not replayed to Qwen) |
 
 ---
 
@@ -316,8 +322,8 @@ print(resp.choices[0].message.content)
 
 ```
 qwen-api/
-├── main.js          # Express server: endpoints, WAF handling, SSE bridge, dashboard
-├── config.js        # Env-driven configuration (token, auth, WAF, logging)
+├── main.js          # Express server: endpoints, WAF handling, SSE bridge, debug logging
+├── config.js        # Env-driven configuration (token, auth, WAF)
 ├── package.json
 └── README.md
 ```
@@ -330,9 +336,9 @@ qwen-api/
 - `usage` token counts are estimates (`characters / 4`) — treat them as approximations.
 - Sessions live **in memory only**: they survive until restart or a 30-minute idle TTL (swept every 5 minutes), and `POST /admin/session/clear` wipes them immediately.
 - Text-to-text only (`chat_type: "t2t"`) — image and file uploads are not supported.
-- `persistHistory` stores exchanges for `/admin/stats`; stored messages are never replayed to Qwen — multi-turn context comes from threading (`parent_id`), not history replay.
+- Multi-turn context comes exclusively from threading (`parent_id`) — no request/response history is stored or replayed.
 - The default auth token (`Waguri`) is a placeholder — set `AUTH_TOKEN` in production.
-- `LOG_LEVEL=debug` dumps every Qwen request body, raw SSE line, and response metadata — useful for troubleshooting WAF/version issues.
+- `--debug` / `DEBUG=true` dumps every Qwen request (headers, payload) and response (status, headers, body) — useful for troubleshooting WAF/version issues. Note it prints the `Cookie` header containing your Qwen JWT; use it only in trusted environments.
 - If Qwen answers `401`, your `QWEN_TOKEN` expired — grab a fresh one from `localStorage.getItem('token')`.
 
 ---

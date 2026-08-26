@@ -38,8 +38,4 @@ module.exports = {
 
   // Parse XML/JSON tool calls from model output and re-emit as proper tool_use blocks
   parseTool: process.env.PARSE_TOOL !== "false",
-
-  logging: {
-    level: process.env.LOG_LEVEL || "info", // "debug" | "info"
-  },
 };
